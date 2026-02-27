@@ -1,244 +1,261 @@
 #include <stdio.h>
+#include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "bsp/esp-bsp.h"
 #include "lvgl.h"
-
-
-#include <math.h>
-#include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 
-// Audio configuration
+// Networking & Time Includes
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_sntp.h"
+
+// Check if the secrets file exists before trying to include it
+#if __has_include("secrets.h")
+    #include "secrets.h"
+#else
+    // If it's missing, stop the build and print this exact message to the terminal!
+    #error "Missing 'secrets.h'! Please copy 'main/secrets.h.example' to 'main/secrets.h' and enter your Wi-Fi credentials."
+#endif
+// ---------------------------------------------------------------------
+// CONFIGURATION
+// ---------------------------------------------------------------------
+#define LCD_H_RES       720
+#define LCD_V_RES       720
+
 #define SAMPLE_RATE     16000
 #define BEEP_FREQ_HZ    1000
-#define BEEP_DURATION   50 // milliseconds
+#define BEEP_DURATION   50
+#define BOOP_FREQ_HZ    400
+#define BOOP_DURATION   100
 
-// We will use the Codec Device handle provided by the BSP
+// ---------------------------------------------------------------------
+// GLOBALS
+// ---------------------------------------------------------------------
 static esp_codec_dev_handle_t spk_codec_dev = NULL;
+static lv_obj_t * time_label;
 
+// ---------------------------------------------------------------------
+// AUDIO FUNCTIONS
+// ---------------------------------------------------------------------
 void play_beep(void)
 {
-    if (!spk_codec_dev) return; // Guard in case audio isn't initialized
-
-    // Calculate how many samples we need for a 50ms beep
+    if (!spk_codec_dev) return;
     size_t num_samples = (SAMPLE_RATE * BEEP_DURATION) / 1000;
     int16_t *audio_buffer = malloc(num_samples * sizeof(int16_t));
-
     if (!audio_buffer) return;
 
-    // Generate a simple square wave at 1000Hz
     int half_period = SAMPLE_RATE / BEEP_FREQ_HZ / 2;
     for (size_t i = 0; i < num_samples; i++) {
-        // Alternate between high and low amplitude
         audio_buffer[i] = ((i / half_period) % 2) ? 10000 : -10000;
     }
-
-    // Push the generated audio to the Codec
     esp_codec_dev_write(spk_codec_dev, audio_buffer, num_samples * sizeof(int16_t));
-
     free(audio_buffer);
 }
-
-#define BOOP_FREQ_HZ    400
-#define BOOP_DURATION   100 // milliseconds
 
 void play_boop(void)
 {
     if (!spk_codec_dev) return;
-
     size_t num_samples = (SAMPLE_RATE * BOOP_DURATION) / 1000;
     int16_t *audio_buffer = malloc(num_samples * sizeof(int16_t));
-
     if (!audio_buffer) return;
 
-    // Generate a lower-pitched square wave
     int half_period = SAMPLE_RATE / BOOP_FREQ_HZ / 2;
     for (size_t i = 0; i < num_samples; i++) {
         audio_buffer[i] = ((i / half_period) % 2) ? 10000 : -10000;
     }
-
     esp_codec_dev_write(spk_codec_dev, audio_buffer, num_samples * sizeof(int16_t));
     free(audio_buffer);
 }
 
+// ---------------------------------------------------------------------
+// LVGL CALLBACKS
+// ---------------------------------------------------------------------
+
+// 1. Rainbow Background Timer
+static void rainbow_bg_timer_cb(lv_timer_t * timer)
+{
+    lv_obj_t * scr = lv_timer_get_user_data(timer);
+    static uint16_t bg_hue = 0;
+
+    bg_hue++;
+    if (bg_hue >= 360) bg_hue = 0;
+
+    lv_color_t bg_color = lv_color_hsv_to_rgb(bg_hue, 50, 30);
+    lv_obj_set_style_bg_color(scr, bg_color, 0);
+}
+
+// 2. Clock Update Timer
+static void update_time_cb(lv_timer_t * timer)
+{
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    // If year is > 100, we are past the year 2000 and NTP has synced
+    if (timeinfo.tm_year > 100) {
+        lv_label_set_text_fmt(time_label, "%02d:%02d:%02d",
+                              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    } else {
+        lv_label_set_text(time_label, "Waiting for Wi-Fi...");
+    }
+}
+
+// 3. Slider Volume Control
+static void volume_slider_event_cb(lv_event_t * e)
+{
+    lv_obj_t * slider = lv_event_get_target(e);
+    int volume = lv_slider_get_value(slider);
+
+    if (spk_codec_dev) {
+        esp_codec_dev_set_out_vol(spk_codec_dev, volume);
+    }
+}
+
+// 4. Circle Boop Interaction
 static void circle_touch_event_cb(lv_event_t * e)
 {
     lv_event_code_t code = lv_event_get_code(e);
-
-    // Play our new sound only on the initial press
     if(code == LV_EVENT_PRESSED) {
         play_boop();
-        printf("Circle was clicked! Boop!\n");
     }
 }
 
-// Hardware specific definitions
-#define LCD_H_RES 720
-#define LCD_V_RES 720
-
-static void volume_slider_event_cb(lv_event_t * e)
-{
-    // Grab the slider object that triggered the event
-    lv_obj_t * slider = lv_event_get_target(e);
-
-    // Get the current value of the slider (0-100)
-    int volume = lv_slider_get_value(slider);
-
-    // If our audio codec is initialized, update the hardware volume!
-    if (spk_codec_dev) {
-        esp_codec_dev_set_out_vol(spk_codec_dev, volume);
-        printf("Volume set to: %d%%\n", volume);
-    }
-}
-
-// ---------------------------------------------------------------------
-// TOUCH EVENT HANDLER
-// ---------------------------------------------------------------------
+// 5. Background Touch Interaction (Color Picker & Beep)
 static void screen_touch_event_cb(lv_event_t * e)
 {
-    // Get the specific event type
     lv_event_code_t code = lv_event_get_code(e);
 
-    if (code == LV_EVENT_PRESSED) {
-        play_beep(); // Play a beep sound when the user first touches the screen
+    if(code == LV_EVENT_PRESSED) {
+        play_beep();
     }
 
-    // We want to trigger when the user first touches AND when they drag their finger
     if(code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING) {
-
-        // Retrieve the circle object we passed in via user_data
         lv_obj_t * circle = lv_event_get_user_data(e);
-
-        // Get the active input device (the touch screen)
         lv_indev_t * indev = lv_indev_active();
         if(!indev) return;
 
-        // Get the current touch X and Y coordinates
         lv_point_t p;
         lv_indev_get_point(indev, &p);
 
-        // Clamp the values just in case hardware reports slightly out of bounds
         int32_t x = p.x < 0 ? 0 : (p.x >= LCD_H_RES ? LCD_H_RES - 1 : p.x);
         int32_t y = p.y < 0 ? 0 : (p.y >= LCD_V_RES ? LCD_V_RES - 1 : p.y);
 
-        // Map X (0-719) to Hue (0-359 degrees on the color wheel)
         uint16_t hue = (x * 360) / LCD_H_RES;
-
-        // Map Y (0-719) to Saturation (0-100%). Top of screen = 100% vivid, Bottom = 0% (white)
         uint8_t sat = 100 - ((y * 100) / LCD_V_RES);
 
-        // Create the new color using HSV (Hue, Saturation, Value) and apply it to the circle
         lv_color_t touch_color = lv_color_hsv_to_rgb(hue, sat, 100);
         lv_obj_set_style_bg_color(circle, touch_color, 0);
     }
 }
 
-static void rainbow_bg_timer_cb(lv_timer_t * timer)
-{
-    // Retrieve the screen object we passed in via user_data
-    lv_obj_t * scr = lv_timer_get_user_data(timer);
-
-    // We use a static variable so it remembers the hue between timer ticks
-    static uint16_t bg_hue = 0;
-
-    // Increment the hue by 1 degree
-    bg_hue++;
-
-    // The color wheel goes from 0 to 359 degrees. Wrap it back to 0!
-    if (bg_hue >= 360) {
-        bg_hue = 0;
-    }
-
-    // Convert HSV to RGB.
-    // We use 50% Saturation and 30% Value so the background stays dark and pastel,
-    // ensuring your bright red circle and white text still pop clearly!
-    lv_color_t bg_color = lv_color_hsv_to_rgb(bg_hue, 50, 30);
-
-    // Apply the new color to the background
-    lv_obj_set_style_bg_color(scr, bg_color, 0);
-}
-
 // ---------------------------------------------------------------------
 // UI SETUP
 // ---------------------------------------------------------------------
-void create_circle_ui(void)
+void create_interactive_ui(void)
 {
     lv_obj_t * scr = lv_screen_active();
-
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_timer_create(rainbow_bg_timer_cb, 50, scr);
 
-    // 1. Create the Circle (same as before)
+    // Circle
     lv_obj_t * circle = lv_obj_create(scr);
     lv_obj_set_size(circle, 300, 300);
     lv_obj_align(circle, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(circle, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(circle, lv_palette_main(LV_PALETTE_RED), 0);
     lv_obj_set_style_border_width(circle, 0, 0);
+    lv_obj_add_flag(circle, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(circle, circle_touch_event_cb, LV_EVENT_ALL, NULL);
 
-    lv_obj_add_flag(circle, LV_OBJ_FLAG_CLICKABLE); // Make the circle itself clickable
-    lv_obj_add_event_cb(circle, circle_touch_event_cb, LV_EVENT_ALL, NULL); // Attach the boop event to the circle
-
-    // Attach the background color-changing event
+    // Background Interaction
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr, screen_touch_event_cb, LV_EVENT_ALL, circle);
 
-    // 2. Create the Volume Slider
+    // Volume Slider
     lv_obj_t * slider = lv_slider_create(scr);
-
-    // Make it nice and wide, but thin
     lv_obj_set_size(slider, 400, 20);
-
-    // Position it at the bottom middle, 50 pixels up from the very bottom edge
     lv_obj_align(slider, LV_ALIGN_BOTTOM_MID, 0, -50);
-
-    // Set the volume range (0 to 100)
     lv_slider_set_range(slider, 0, 100);
-
-    // Set the default slider position to match our default audio init volume (70%)
     lv_slider_set_value(slider, 70, LV_ANIM_OFF);
-
-    // Attach our volume callback to trigger whenever the value changes
     lv_obj_add_event_cb(slider, volume_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Clock Label
+    time_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(time_label, lv_color_white(), 0);
+    lv_obj_align(time_label, LV_ALIGN_TOP_MID, 0, 40);
+    lv_label_set_text(time_label, "Waiting for Wi-Fi...");
+    lv_timer_create(update_time_cb, 1000, NULL);
 }
 
+// ---------------------------------------------------------------------
+// MAIN APPLICATION
+// ---------------------------------------------------------------------
 void app_main(void)
 {
-    printf("Starting ESP32-P4 LVGL Touch Application...\n");
+    printf("Starting ESP32-P4 Ultimate UI Application...\n");
 
-    // Initialize MIPI DSI, LCD, Touch, PSRAM, and LVGL tasks
+    // 1. Initialize NVS (Required for Wi-Fi data storage)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // 2. Hardware (Display & Audio)
     bsp_display_start();
     bsp_display_backlight_on();
 
-    // 1. Initialize the I2S bus (passing NULL uses standard 16-bit, 16kHz settings)
     if (bsp_audio_init(NULL) == ESP_OK) {
-
-        // 2. Initialize the specific ES8311 codec chip via I2C and get a handle
         spk_codec_dev = bsp_audio_codec_speaker_init();
-
         if (spk_codec_dev) {
-            // 3. Configure the codec for our beep's sample rate and set the volume
             esp_codec_dev_sample_info_t fs = {
                 .sample_rate = SAMPLE_RATE,
                 .channel = 1,
                 .bits_per_sample = 16,
             };
             esp_codec_dev_open(spk_codec_dev, &fs);
-            esp_codec_dev_set_out_vol(spk_codec_dev, 70); // Set volume to 70%
-            printf("Audio Codec Initialized Successfully!\n");
-        } else {
-            printf("WARNING: Codec handle is NULL.\n");
+            esp_codec_dev_set_out_vol(spk_codec_dev, 70);
         }
-    } else {
-        printf("WARNING: I2S Bus failed to initialize.\n");
     }
 
-    // Lock the display/LVGL port before interacting with the UI
-    bsp_display_lock(0);
-    create_circle_ui();
-    bsp_display_unlock();
+    // 3. Wi-Fi Initialization (Over SDIO to the C6)
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
 
-    printf("UI Setup Complete. Try touching and dragging on the screen!\n");
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_connect());
+
+    // 4. NTP Setup
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    // Central European Time. Change if you are elsewhere!
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+    tzset();
+
+    // 5. Build the UI
+    bsp_display_lock(0);
+    create_interactive_ui();
+    bsp_display_unlock();
 }

@@ -12,3 +12,5 @@ sdkconfig.old
 .idea/
 *.swp
 .DS_Store
+
+main/secrets.h
