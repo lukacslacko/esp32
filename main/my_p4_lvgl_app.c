@@ -135,12 +135,40 @@ static void screen_touch_event_cb(lv_event_t * e)
     }
 }
 
+static void rainbow_bg_timer_cb(lv_timer_t * timer)
+{
+    // Retrieve the screen object we passed in via user_data
+    lv_obj_t * scr = lv_timer_get_user_data(timer);
+
+    // We use a static variable so it remembers the hue between timer ticks
+    static uint16_t bg_hue = 0;
+
+    // Increment the hue by 1 degree
+    bg_hue++;
+
+    // The color wheel goes from 0 to 359 degrees. Wrap it back to 0!
+    if (bg_hue >= 360) {
+        bg_hue = 0;
+    }
+
+    // Convert HSV to RGB.
+    // We use 50% Saturation and 30% Value so the background stays dark and pastel,
+    // ensuring your bright red circle and white text still pop clearly!
+    lv_color_t bg_color = lv_color_hsv_to_rgb(bg_hue, 50, 30);
+
+    // Apply the new color to the background
+    lv_obj_set_style_bg_color(scr, bg_color, 0);
+}
+
 // ---------------------------------------------------------------------
 // UI SETUP
 // ---------------------------------------------------------------------
 void create_circle_ui(void)
 {
     lv_obj_t * scr = lv_screen_active();
+
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_timer_create(rainbow_bg_timer_cb, 50, scr);
 
     // 1. Create the Circle (same as before)
     lv_obj_t * circle = lv_obj_create(scr);
