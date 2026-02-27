@@ -1,0 +1,14 @@
+# ESP-IDF Build and Output
+build/
+
+# ESP-IDF Component Manager
+managed_components/
+
+# Menuconfig backups
+sdkconfig.old
+
+# IDE specific files (optional, but good practice)
+.vscode/
+.idea/
+*.swp
+.DS_Store
