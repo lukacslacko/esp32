@@ -38,7 +38,41 @@ void play_beep(void)
     // Push the generated audio to the Codec
     esp_codec_dev_write(spk_codec_dev, audio_buffer, num_samples * sizeof(int16_t));
 
-    free(audio_buffer);}
+    free(audio_buffer);
+}
+
+#define BOOP_FREQ_HZ    400
+#define BOOP_DURATION   100 // milliseconds
+
+void play_boop(void)
+{
+    if (!spk_codec_dev) return;
+
+    size_t num_samples = (SAMPLE_RATE * BOOP_DURATION) / 1000;
+    int16_t *audio_buffer = malloc(num_samples * sizeof(int16_t));
+
+    if (!audio_buffer) return;
+
+    // Generate a lower-pitched square wave
+    int half_period = SAMPLE_RATE / BOOP_FREQ_HZ / 2;
+    for (size_t i = 0; i < num_samples; i++) {
+        audio_buffer[i] = ((i / half_period) % 2) ? 10000 : -10000;
+    }
+
+    esp_codec_dev_write(spk_codec_dev, audio_buffer, num_samples * sizeof(int16_t));
+    free(audio_buffer);
+}
+
+static void circle_touch_event_cb(lv_event_t * e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+
+    // Play our new sound only on the initial press
+    if(code == LV_EVENT_PRESSED) {
+        play_boop();
+        printf("Circle was clicked! Boop!\n");
+    }
+}
 
 // Hardware specific definitions
 #define LCD_H_RES 720
@@ -106,7 +140,7 @@ static void screen_touch_event_cb(lv_event_t * e)
 // ---------------------------------------------------------------------
 void create_circle_ui(void)
 {
-lv_obj_t * scr = lv_screen_active();
+    lv_obj_t * scr = lv_screen_active();
 
     // 1. Create the Circle (same as before)
     lv_obj_t * circle = lv_obj_create(scr);
@@ -115,6 +149,9 @@ lv_obj_t * scr = lv_screen_active();
     lv_obj_set_style_radius(circle, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(circle, lv_palette_main(LV_PALETTE_RED), 0);
     lv_obj_set_style_border_width(circle, 0, 0);
+
+    lv_obj_add_flag(circle, LV_OBJ_FLAG_CLICKABLE); // Make the circle itself clickable
+    lv_obj_add_event_cb(circle, circle_touch_event_cb, LV_EVENT_ALL, NULL); // Attach the boop event to the circle
 
     // Attach the background color-changing event
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
