@@ -44,6 +44,21 @@ void play_beep(void)
 #define LCD_H_RES 720
 #define LCD_V_RES 720
 
+static void volume_slider_event_cb(lv_event_t * e)
+{
+    // Grab the slider object that triggered the event
+    lv_obj_t * slider = lv_event_get_target(e);
+
+    // Get the current value of the slider (0-100)
+    int volume = lv_slider_get_value(slider);
+
+    // If our audio codec is initialized, update the hardware volume!
+    if (spk_codec_dev) {
+        esp_codec_dev_set_out_vol(spk_codec_dev, volume);
+        printf("Volume set to: %d%%\n", volume);
+    }
+}
+
 // ---------------------------------------------------------------------
 // TOUCH EVENT HANDLER
 // ---------------------------------------------------------------------
@@ -91,10 +106,9 @@ static void screen_touch_event_cb(lv_event_t * e)
 // ---------------------------------------------------------------------
 void create_circle_ui(void)
 {
-    // Get the active screen
-    lv_obj_t * scr = lv_screen_active();
+lv_obj_t * scr = lv_screen_active();
 
-    // Create the circle
+    // 1. Create the Circle (same as before)
     lv_obj_t * circle = lv_obj_create(scr);
     lv_obj_set_size(circle, 300, 300);
     lv_obj_align(circle, LV_ALIGN_CENTER, 0, 0);
@@ -102,12 +116,27 @@ void create_circle_ui(void)
     lv_obj_set_style_bg_color(circle, lv_palette_main(LV_PALETTE_RED), 0);
     lv_obj_set_style_border_width(circle, 0, 0);
 
-    // Make sure the background screen is flagged as clickable
+    // Attach the background color-changing event
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
-
-    // Attach the event callback to the background screen.
-    // We pass the 'circle' pointer as the user_data so the callback knows what to recolor!
     lv_obj_add_event_cb(scr, screen_touch_event_cb, LV_EVENT_ALL, circle);
+
+    // 2. Create the Volume Slider
+    lv_obj_t * slider = lv_slider_create(scr);
+
+    // Make it nice and wide, but thin
+    lv_obj_set_size(slider, 400, 20);
+
+    // Position it at the bottom middle, 50 pixels up from the very bottom edge
+    lv_obj_align(slider, LV_ALIGN_BOTTOM_MID, 0, -50);
+
+    // Set the volume range (0 to 100)
+    lv_slider_set_range(slider, 0, 100);
+
+    // Set the default slider position to match our default audio init volume (70%)
+    lv_slider_set_value(slider, 70, LV_ANIM_OFF);
+
+    // Attach our volume callback to trigger whenever the value changes
+    lv_obj_add_event_cb(slider, volume_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
 void app_main(void)
