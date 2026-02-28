@@ -41,7 +41,7 @@ static esp_codec_dev_handle_t spk_codec_dev = NULL;
 static lv_obj_t * time_label;
 
 // ---------------------------------------------------------------------
-// SYNTHESIS & AUDIO
+// SYNTHESIS & AUDIO (POLYPHONIC + ADSR)
 // ---------------------------------------------------------------------
 #include <math.h>
 
@@ -49,16 +49,76 @@ static lv_obj_t * time_label;
 #define M_PI 3.14159265358979323846
 #endif
 
-volatile float synth_freq = 0.0f;
+#define MAX_VOICES 5
+
+typedef enum {
+    ENV_IDLE = 0,
+    ENV_ATTACK,
+    ENV_DECAY,
+    ENV_SUSTAIN,
+    ENV_RELEASE
+} env_state_t;
+
+typedef struct {
+    float phase;
+    float freq;
+    int note_idx;
+    env_state_t env_state;
+    float env_val;
+} voice_t;
+
+static voice_t voices[MAX_VOICES];
+
 volatile int synth_waveform = 1; // 0=Sine, 1=Square, 2=Saw
 volatile float synth_volume = 0.4f;
-volatile bool note_playing = false;
+
+// ADSR parameters
+volatile float env_a_time = 0.1f;  // 0.01 to 2.0s
+volatile float env_d_time = 0.1f;  // 0.01 to 2.0s
+volatile float env_s_level = 0.5f; // 0.0 to 1.0
+volatile float env_r_time = 0.3f;  // 0.01 to 2.0s
+
+static void note_on(int note_idx, float freq) {
+    int target_v = -1;
+    // Try to find a free voice
+    for (int v = 0; v < MAX_VOICES; v++) {
+        if (voices[v].env_state == ENV_IDLE) {
+            target_v = v; break;
+        }
+    }
+    // If none free, find one in RELEASE
+    if (target_v == -1) {
+        for (int v = 0; v < MAX_VOICES; v++) {
+            if (voices[v].env_state == ENV_RELEASE) {
+                target_v = v; break;
+            }
+        }
+    }
+    // If still none, steal voice 0 (or oldest, but keep simple)
+    if (target_v == -1) target_v = 0;
+
+    voices[target_v].freq = freq;
+    voices[target_v].note_idx = note_idx;
+    voices[target_v].env_state = ENV_ATTACK;
+    voices[target_v].phase = 0.0f;
+    // Don't reset env_val to 0 to avoid clicking, let it rise from current
+}
+
+static void note_off(int note_idx) {
+    for (int v = 0; v < MAX_VOICES; v++) {
+        if (voices[v].note_idx == note_idx &&
+            voices[v].env_state != ENV_IDLE &&
+            voices[v].env_state != ENV_RELEASE) {
+            voices[v].env_state = ENV_RELEASE;
+        }
+    }
+}
 
 static void audio_task(void *pvParameters)
 {
     size_t num_samples = 256;
     int16_t *audio_buffer = malloc(num_samples * sizeof(int16_t));
-    float phase = 0.0f;
+    float sample_rate_f = (float)SAMPLE_RATE;
 
     while (1) {
         if (!spk_codec_dev) {
@@ -66,33 +126,81 @@ static void audio_task(void *pvParameters)
             continue;
         }
 
-        float current_freq_local = synth_freq;
         int wav_local = synth_waveform;
-        bool playing_local = note_playing;
         float vol_local = synth_volume;
+        float a_time = env_a_time < 0.01f ? 0.01f : env_a_time;
+        float d_time = env_d_time < 0.01f ? 0.01f : env_d_time;
+        float s_lvl = env_s_level < 0.01f ? 0.01f : env_s_level;
+        float r_time = env_r_time < 0.01f ? 0.01f : env_r_time;
 
-        if (playing_local && current_freq_local > 0) {
-            float phase_inc = current_freq_local / SAMPLE_RATE;
-            for (size_t i = 0; i < num_samples; i++) {
-                float sample_p = 0.0f;
-                if (wav_local == 0) { // Sine
-                    sample_p = sinf(2.0f * (float)M_PI * phase);
-                } else if (wav_local == 1) { // Square
-                    sample_p = (phase < 0.5f) ? 1.0f : -1.0f;
-                } else if (wav_local == 2) { // Sawtooth
-                    sample_p = 2.0f * phase - 1.0f;
+        float a_rate = 1.0f / (a_time * sample_rate_f);
+        float d_rate = (1.0f - s_lvl) / (d_time * sample_rate_f);
+        float r_rate = s_lvl / (r_time * sample_rate_f);
+
+        for (size_t i = 0; i < num_samples; i++) {
+            float mixed_sample = 0.0f;
+
+            for (int v = 0; v < MAX_VOICES; v++) {
+                if (voices[v].env_state == ENV_IDLE) continue;
+
+                // Process Envelope
+                switch(voices[v].env_state) {
+                    case ENV_ATTACK:
+                        voices[v].env_val += a_rate;
+                        if (voices[v].env_val >= 1.0f) {
+                            voices[v].env_val = 1.0f;
+                            voices[v].env_state = ENV_DECAY;
+                        }
+                        break;
+                    case ENV_DECAY:
+                        voices[v].env_val -= d_rate;
+                        if (voices[v].env_val <= s_lvl) {
+                            voices[v].env_val = s_lvl;
+                            voices[v].env_state = ENV_SUSTAIN;
+                        }
+                        break;
+                    case ENV_SUSTAIN:
+                        // Hold level
+                        voices[v].env_val = s_lvl;
+                        break;
+                    case ENV_RELEASE:
+                        // Release from current envelope value
+                        voices[v].env_val -= r_rate;
+                        if (voices[v].env_val <= 0.0f) {
+                            voices[v].env_val = 0.0f;
+                            voices[v].env_state = ENV_IDLE;
+                        }
+                        break;
+                    default: break;
                 }
 
-                audio_buffer[i] = (int16_t)(sample_p * 32767.0f * vol_local);
+                if(voices[v].env_state == ENV_IDLE) continue;
 
-                phase += phase_inc;
-                if (phase >= 1.0f) phase -= 1.0f;
+                // Oscillator
+                float sample_p = 0.0f;
+                if (wav_local == 0) { // Sine
+                    sample_p = sinf(2.0f * (float)M_PI * voices[v].phase);
+                } else if (wav_local == 1) { // Square
+                    sample_p = (voices[v].phase < 0.5f) ? 1.0f : -1.0f;
+                } else if (wav_local == 2) { // Sawtooth
+                    sample_p = 2.0f * voices[v].phase - 1.0f;
+                }
+
+                mixed_sample += sample_p * voices[v].env_val;
+
+                // Advance phase
+                voices[v].phase += voices[v].freq / sample_rate_f;
+                if (voices[v].phase >= 1.0f) voices[v].phase -= 1.0f;
             }
-        } else {
-            for (size_t i = 0; i < num_samples; i++) {
-                audio_buffer[i] = 0;
-            }
-            phase = 0.0f;
+
+            // Mix down and apply volume
+            mixed_sample *= vol_local / 2.0f; // Soften to prevent clipping when multiple notes play
+
+            // Hard clip to [-1.0, 1.0]
+            if(mixed_sample > 1.0f) mixed_sample = 1.0f;
+            else if(mixed_sample < -1.0f) mixed_sample = -1.0f;
+
+            audio_buffer[i] = (int16_t)(mixed_sample * 32767.0f);
         }
 
         esp_codec_dev_write(spk_codec_dev, audio_buffer, num_samples * sizeof(int16_t));
@@ -143,12 +251,9 @@ static void key_event_cb(lv_event_t * e)
     int note_idx = (int)(intptr_t)lv_event_get_user_data(e);
 
     if (code == LV_EVENT_PRESSED) {
-        synth_freq = note_freqs[note_idx];
-        note_playing = true;
+        note_on(note_idx, note_freqs[note_idx]);
     } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
-        if (synth_freq == note_freqs[note_idx]) {
-            note_playing = false;
-        }
+        note_off(note_idx);
     }
 }
 
@@ -162,6 +267,20 @@ static void vol_slider_event_cb(lv_event_t * e)
 {
     lv_obj_t * slider = lv_event_get_target(e);
     synth_volume = lv_slider_get_value(slider) / 100.0f;
+}
+
+static void env_slider_event_cb(lv_event_t * e)
+{
+    lv_obj_t * slider = lv_event_get_target(e);
+    int type = (int)(intptr_t)lv_event_get_user_data(e);
+    float val = (float)lv_slider_get_value(slider);
+
+    switch(type) {
+        case 0: env_a_time = val / 100.0f; break; // 0.0 to 1.0s (or 2.0s if map to 200)
+        case 1: env_d_time = val / 100.0f; break;
+        case 2: env_s_level = val / 100.0f; break; // 0.0 to 1.0 multiplier
+        case 3: env_r_time = val / 100.0f; break;
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -218,22 +337,34 @@ void create_synth_ui(void)
     lv_dropdown_set_selected(wave_dd, 1);
     lv_obj_add_event_cb(wave_dd, wave_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Master volume slider
-    lv_obj_t * vol_cont = lv_obj_create(controls);
-    lv_obj_set_size(vol_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(vol_cont, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_bg_opa(vol_cont, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(vol_cont, 0, 0);
+    // ADSR and Volume Sliders
+    const char* sl_labels[] = {"A", "D", "S", "R", "Vol"};
+    int sl_initials[] = {10, 10, 50, 30, 40}; // mapped to 0-100
 
-    lv_obj_t * vol_label = lv_label_create(vol_cont);
-    lv_obj_set_style_text_color(vol_label, lv_color_white(), 0);
-    lv_label_set_text(vol_label, "Volume");
+    for (int s = 0; s < 5; s++) {
+        lv_obj_t * s_cont = lv_obj_create(controls);
+        lv_obj_set_size(s_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(s_cont, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(s_cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_bg_opa(s_cont, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(s_cont, 0, 0);
+        lv_obj_set_style_pad_all(s_cont, 0, 0);
 
-    lv_obj_t * vol_slider = lv_slider_create(vol_cont);
-    lv_obj_set_size(vol_slider, 200, 20);
-    lv_slider_set_range(vol_slider, 0, 100);
-    lv_slider_set_value(vol_slider, 40, LV_ANIM_OFF);
-    lv_obj_add_event_cb(vol_slider, vol_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_t * sl = lv_slider_create(s_cont);
+        lv_obj_set_size(sl, 20, 120); // vertical slider
+        lv_slider_set_range(sl, 0, 100);
+        lv_slider_set_value(sl, sl_initials[s], LV_ANIM_OFF);
+
+        if (s < 4) {
+            lv_obj_add_event_cb(sl, env_slider_event_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)s);
+        } else {
+            lv_obj_add_event_cb(sl, vol_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        }
+
+        lv_obj_t * lbl = lv_label_create(s_cont);
+        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        lv_label_set_text(lbl, sl_labels[s]);
+    }
 
     // Keyboard container
     lv_obj_t * kb_cont = lv_obj_create(scr);
