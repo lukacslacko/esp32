@@ -48,6 +48,9 @@ static lv_obj_t * main_menu_scr;
 static lv_obj_t * synth_scr;
 static lv_obj_t * clock_scr;
 static lv_obj_t * record_scr;
+static lv_obj_t * record_canvas = NULL;
+static uint8_t * record_canvas_raw_buf = NULL;
+static uint8_t * record_canvas_aligned_buf = NULL;
 
 static lv_obj_t * clock_hour_hand;
 static lv_obj_t * clock_min_hand;
@@ -382,6 +385,71 @@ static void btn_go_menu_cb(lv_event_t * e) {
     lv_scr_load(main_menu_scr);
 }
 
+static lv_color_t get_heatmap_color(float intensity) {
+    if (intensity < 0.0f) intensity = 0.0f;
+    if (intensity > 1.0f) intensity = 1.0f;
+    uint8_t r = 0, g = 0, b = 0;
+    
+    if (intensity < 0.25f) {
+        float t = intensity / 0.25f;
+        b = (uint8_t)(t * 255.0f);
+    } else if (intensity < 0.5f) {
+        float t = (intensity - 0.25f) / 0.25f;
+        r = (uint8_t)(t * 255.0f);
+        b = (uint8_t)((1.0f - t) * 255.0f);
+    } else if (intensity < 0.75f) {
+        float t = (intensity - 0.5f) / 0.25f;
+        r = 255;
+        g = (uint8_t)(t * 255.0f);
+    } else {
+        float t = (intensity - 0.75f) / 0.25f;
+        r = 255;
+        g = 255;
+        b = (uint8_t)(t * 255.0f);
+    }
+    return lv_color_make(r, g, b);
+}
+
+static void compute_fft(float *vReal, float *vImag, uint16_t n) {
+    uint16_t j = 0;
+    for (uint16_t i = 0; i < n - 1; i++) {
+        if (i < j) {
+            float tempReal = vReal[i];
+            float tempImag = vImag[i];
+            vReal[i] = vReal[j];
+            vImag[i] = vImag[j];
+            vReal[j] = tempReal;
+            vImag[j] = tempImag;
+        }
+        uint16_t k = n / 2;
+        while (k <= j) {
+            j -= k;
+            k /= 2;
+        }
+        j += k;
+    }
+    for (uint16_t step = 1; step < n; step *= 2) {
+        float arg = M_PI / step;
+        float c = cosf(arg);
+        float s = -sinf(arg);
+        float uReal = 1.0f;
+        float uImag = 0.0f;
+        for (uint16_t j2 = 0; j2 < step; j2++) {
+            for (uint16_t i = j2; i < n; i += 2 * step) {
+                float tReal = uReal * vReal[i + step] - uImag * vImag[i + step];
+                float tImag = uReal * vImag[i + step] + uImag * vReal[i + step];
+                vReal[i + step] = vReal[i] - tReal;
+                vImag[i + step] = vImag[i] - tImag;
+                vReal[i] += tReal;
+                vImag[i] += tImag;
+            }
+            float tempReal = uReal * c - uImag * s;
+            uImag = uReal * s + uImag * c;
+            uReal = tempReal;
+        }
+    }
+}
+
 static void btn_record_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * btn = lv_event_get_target(e);
@@ -422,6 +490,74 @@ static void btn_record_event_cb(lv_event_t * e) {
 
             rec_play_idx = rec_sample_count - 1;
             is_playing_reverse = true;
+
+            if (record_canvas && record_canvas_aligned_buf) {
+                int chart_h = 240;
+                int chart_w = 640;
+                lv_canvas_fill_bg(record_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+                
+                int step = rec_sample_count / chart_w;
+                if (step == 0) step = 1;
+
+                int FFT_SIZE = 1024;
+                float *vReal = malloc(FFT_SIZE * sizeof(float));
+                float *vImag = malloc(FFT_SIZE * sizeof(float));
+                float *mags  = malloc((FFT_SIZE / 2) * sizeof(float));
+                
+                if (vReal && vImag && mags) {
+                    int num_bins = FFT_SIZE / 2;
+                    float log_max = logf((float)(num_bins - 1));
+
+                    for (int x = 0; x < chart_w; x++) {
+                        int start_idx = x * step;
+                        
+                        // Fill FFT buffer
+                        for (int i = 0; i < FFT_SIZE; i++) {
+                            if (start_idx + i < rec_sample_count && start_idx + i >= 0) {
+                                // Apply Hanning Window
+                                float mult = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (FFT_SIZE - 1)));
+                                vReal[i] = (float)rec_buffer[start_idx + i] * mult;
+                            } else {
+                                vReal[i] = 0.0f;
+                            }
+                            vImag[i] = 0.0f;
+                        }
+                        
+                        compute_fft(vReal, vImag, FFT_SIZE);
+                        
+                        float max_mag = 0.0f;
+                        
+                        for (int i = 0; i < num_bins; i++) {
+                            float mag = sqrtf(vReal[i]*vReal[i] + vImag[i]*vImag[i]);
+                            mags[i] = mag;
+                            if (i > 0 && mag > max_mag) {
+                                max_mag = mag;
+                            }
+                        }
+                        
+                        if (max_mag < 1000.0f) max_mag = 1000.0f; 
+                        float scale = 1.0f / (max_mag * 0.7f);
+                        
+                        for (int y = 0; y < chart_h; y++) {
+                            float ratio = (float)(chart_h - 1 - y) / (float)(chart_h - 1);
+                            float exact_bin = expf(ratio * log_max);
+                            int bin = (int)exact_bin;
+                            
+                            if (bin < 1) bin = 1;
+                            if (bin >= num_bins) bin = num_bins - 1;
+                            
+                            float intensity = mags[bin] * scale;
+                            lv_color_t color = get_heatmap_color(intensity);
+                            lv_canvas_set_px(record_canvas, x, y, color, LV_OPA_COVER);
+                        }
+                    }
+                    free(vReal);
+                    free(vImag);
+                    free(mags);
+                }
+                
+                lv_obj_invalidate(record_canvas);
+            }
         }
     }
 }
@@ -463,7 +599,7 @@ void create_main_menu(void)
     lv_label_set_text(lbl_clock, "Analog Clock");
     lv_obj_center(lbl_clock);
     lv_obj_add_event_cb(btn_clock, btn_go_clock_cb, LV_EVENT_CLICKED, NULL);
-    
+
     lv_obj_t * btn_record = lv_btn_create(main_menu_scr);
     lv_obj_set_size(btn_record, 200, 80);
     lv_obj_align(btn_record, LV_ALIGN_CENTER, 0, 100);
@@ -563,9 +699,9 @@ void create_record_screen(void)
 
     // Central Record Button
     lv_obj_t * btn_rec = lv_btn_create(record_scr);
-    lv_obj_set_size(btn_rec, 300, 300);
-    lv_obj_align(btn_rec, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(btn_rec, 150, 0);
+    lv_obj_set_size(btn_rec, 240, 240);
+    lv_obj_align(btn_rec, LV_ALIGN_TOP_MID, 0, 80);
+    lv_obj_set_style_radius(btn_rec, 120, 0);
     lv_obj_set_style_shadow_width(btn_rec, 0, 0);
     lv_obj_set_style_shadow_width(btn_rec, 0, LV_STATE_PRESSED);
     lv_obj_set_style_bg_color(btn_rec, lv_color_hex(0x555555), 0);
@@ -575,6 +711,22 @@ void create_record_screen(void)
     lv_obj_set_style_text_font(lbl_rec, &lv_font_montserrat_14, 0);
     lv_label_set_text(lbl_rec, "HOLD TO RECORD");
     lv_obj_center(lbl_rec);
+
+    // Audio spectrogram canvas
+    record_canvas = lv_canvas_create(record_scr);
+    lv_obj_set_size(record_canvas, 640, 240);
+    lv_obj_align(record_canvas, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_obj_set_style_border_color(record_canvas, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_border_width(record_canvas, 2, 0);
+    
+    // Allocate the draw buffer for a 640x240 RGB565 canvas from PSRAM
+    size_t canvas_size = 640 * 240 * 2;
+    record_canvas_raw_buf = heap_caps_malloc(canvas_size + 128, MALLOC_CAP_SPIRAM);
+    if (record_canvas_raw_buf) {
+        record_canvas_aligned_buf = (uint8_t *)(((uintptr_t)record_canvas_raw_buf + 63) & ~63);
+        lv_canvas_set_buffer(record_canvas, record_canvas_aligned_buf, 640, 240, LV_COLOR_FORMAT_RGB565);
+        lv_canvas_fill_bg(record_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+    }
 }
 
 void create_synth_ui(void)
@@ -743,7 +895,7 @@ void app_main(void)
             esp_codec_dev_open(spk_codec_dev, &fs);
             esp_codec_dev_set_out_vol(spk_codec_dev, 70);
         }
-        
+
         mic_codec_dev = bsp_audio_codec_microphone_init();
         if (mic_codec_dev) {
             esp_codec_dev_sample_info_t fs_mic = {
