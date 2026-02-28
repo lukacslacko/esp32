@@ -38,7 +38,16 @@
 // GLOBALS
 // ---------------------------------------------------------------------
 static esp_codec_dev_handle_t spk_codec_dev = NULL;
-static lv_obj_t * time_label;
+static lv_obj_t * time_label_synth;
+static lv_obj_t * time_label_menu;
+
+static lv_obj_t * main_menu_scr;
+static lv_obj_t * synth_scr;
+static lv_obj_t * clock_scr;
+
+static lv_obj_t * clock_hour_hand;
+static lv_obj_t * clock_min_hand;
+static lv_obj_t * clock_sec_hand;
 
 // ---------------------------------------------------------------------
 // SYNTHESIS & AUDIO (POLYPHONIC + ADSR)
@@ -221,10 +230,29 @@ static void update_time_cb(lv_timer_t * timer)
 
     // If year is > 100, we are past the year 2000 and NTP has synced
     if (timeinfo.tm_year > 100) {
-        lv_label_set_text_fmt(time_label, "%02d:%02d:%02d",
-                              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        if (time_label_synth) {
+            lv_label_set_text_fmt(time_label_synth, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        }
+        if (time_label_menu) {
+            lv_label_set_text_fmt(time_label_menu, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        }
+        
+        // Update analog clock if created
+        if (clock_sec_hand) {
+            int sec_angle = timeinfo.tm_sec * 60; // 360/60 * 10 = 60 (lvgl uses 0.1 degree units)
+            lv_obj_set_style_transform_rotation(clock_sec_hand, sec_angle, 0);
+        }
+        if (clock_min_hand) {
+            int min_angle = timeinfo.tm_min * 60 + timeinfo.tm_sec; 
+            lv_obj_set_style_transform_rotation(clock_min_hand, min_angle, 0);
+        }
+        if (clock_hour_hand) {
+            int hour_angle = (timeinfo.tm_hour % 12) * 300 + (timeinfo.tm_min * 5);
+            lv_obj_set_style_transform_rotation(clock_hour_hand, hour_angle, 0);
+        }
     } else {
-        lv_label_set_text(time_label, "Waiting for Wi-Fi...");
+        if (time_label_synth) lv_label_set_text(time_label_synth, "Waiting for Wi-Fi...");
+        if (time_label_menu) lv_label_set_text(time_label_menu, "Waiting for Wi-Fi...");
     }
 }
 
@@ -283,12 +311,118 @@ static void env_slider_event_cb(lv_event_t * e)
     }
 }
 
+// Screen Transition Callbacks
+static void btn_go_synth_cb(lv_event_t * e) {
+    lv_scr_load(synth_scr);
+}
+
+static void btn_go_clock_cb(lv_event_t * e) {
+    lv_scr_load(clock_scr);
+}
+
+static void btn_go_menu_cb(lv_event_t * e) {
+    lv_scr_load(main_menu_scr);
+}
+
 // ---------------------------------------------------------------------
 // UI SETUP
 // ---------------------------------------------------------------------
+
+void create_main_menu(void)
+{
+    main_menu_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(main_menu_scr, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_bg_opa(main_menu_scr, LV_OPA_COVER, 0);
+
+    lv_obj_t * title = lv_label_create(main_menu_scr);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, lv_palette_main(LV_PALETTE_AMBER), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+    lv_label_set_text(title, "ESP32-P4 Launchpad");
+
+    time_label_menu = lv_label_create(main_menu_scr);
+    lv_obj_set_style_text_font(time_label_menu, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(time_label_menu, lv_color_white(), 0);
+    lv_obj_align(time_label_menu, LV_ALIGN_TOP_MID, 0, 60);
+    lv_label_set_text(time_label_menu, "Waiting for Wi-Fi...");
+
+    lv_obj_t * btn_synth = lv_btn_create(main_menu_scr);
+    lv_obj_set_size(btn_synth, 200, 80);
+    lv_obj_align(btn_synth, LV_ALIGN_CENTER, 0, -60);
+    lv_obj_t * lbl_synth = lv_label_create(btn_synth);
+    lv_label_set_text(lbl_synth, "NanoSynth");
+    lv_obj_center(lbl_synth);
+    lv_obj_add_event_cb(btn_synth, btn_go_synth_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * btn_clock = lv_btn_create(main_menu_scr);
+    lv_obj_set_size(btn_clock, 200, 80);
+    lv_obj_align(btn_clock, LV_ALIGN_CENTER, 0, 60);
+    lv_obj_t * lbl_clock = lv_label_create(btn_clock);
+    lv_label_set_text(lbl_clock, "Analog Clock");
+    lv_obj_center(lbl_clock);
+    lv_obj_add_event_cb(btn_clock, btn_go_clock_cb, LV_EVENT_CLICKED, NULL);
+}
+
+void create_clock_screen(void)
+{
+    clock_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(clock_scr, lv_color_hex(0x000000), 0);
+
+    lv_obj_t * btn_back = lv_btn_create(clock_scr);
+    lv_obj_set_size(btn_back, 100, 40);
+    lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -10, 10);
+    lv_obj_t * lbl_back = lv_label_create(btn_back);
+    lv_label_set_text(lbl_back, "Back");
+    lv_obj_center(lbl_back);
+    lv_obj_add_event_cb(btn_back, btn_go_menu_cb, LV_EVENT_CLICKED, NULL);
+
+    // Clock Face
+    lv_obj_t * face = lv_obj_create(clock_scr);
+    lv_obj_set_size(face, 400, 400);
+    lv_obj_align(face, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(face, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(face, lv_color_hex(0x222222), 0);
+    lv_obj_set_style_border_color(face, lv_palette_main(LV_PALETTE_AMBER), 0);
+    lv_obj_set_style_border_width(face, 5, 0);
+
+    // Hands
+    clock_hour_hand = lv_obj_create(face);
+    lv_obj_set_size(clock_hour_hand, 8, 120);
+    lv_obj_set_style_bg_color(clock_hour_hand, lv_color_white(), 0);
+    lv_obj_align(clock_hour_hand, LV_ALIGN_CENTER, 0, -40); // Offset upwards so bottom is at center
+    lv_obj_set_style_transform_pivot_x(clock_hour_hand, 4, 0);
+    lv_obj_set_style_transform_pivot_y(clock_hour_hand, 100, 0); // Pivot near the bottom 
+    lv_obj_set_style_border_width(clock_hour_hand, 0, 0);
+
+    clock_min_hand = lv_obj_create(face);
+    lv_obj_set_size(clock_min_hand, 6, 170);
+    lv_obj_set_style_bg_color(clock_min_hand, lv_color_hex(0xcccccc), 0);
+    lv_obj_align(clock_min_hand, LV_ALIGN_CENTER, 0, -65);
+    lv_obj_set_style_transform_pivot_x(clock_min_hand, 3, 0);
+    lv_obj_set_style_transform_pivot_y(clock_min_hand, 150, 0); // Pivot near the bottom
+    lv_obj_set_style_border_width(clock_min_hand, 0, 0);
+
+    clock_sec_hand = lv_obj_create(face);
+    lv_obj_set_size(clock_sec_hand, 2, 190);
+    lv_obj_set_style_bg_color(clock_sec_hand, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_obj_align(clock_sec_hand, LV_ALIGN_CENTER, 0, -75);
+    lv_obj_set_style_transform_pivot_x(clock_sec_hand, 1, 0);
+    lv_obj_set_style_transform_pivot_y(clock_sec_hand, 170, 0); // Pivot near the bottom
+    lv_obj_set_style_border_width(clock_sec_hand, 0, 0);
+
+    // Center dot
+    lv_obj_t * dot = lv_obj_create(face);
+    lv_obj_set_size(dot, 16, 16);
+    lv_obj_align(dot, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(dot, lv_palette_main(LV_PALETTE_AMBER), 0);
+    lv_obj_set_style_border_width(dot, 0, 0);
+}
+
 void create_synth_ui(void)
 {
-    lv_obj_t * scr = lv_screen_active();
+    synth_scr = lv_obj_create(NULL);
+    lv_obj_t * scr = synth_scr;
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x222222), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
@@ -299,17 +433,25 @@ void create_synth_ui(void)
     lv_obj_set_style_bg_color(header, lv_color_hex(0x111111), 0);
     lv_obj_set_style_border_width(header, 0, 0);
 
-    time_label = lv_label_create(header);
-    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(time_label, lv_color_white(), 0);
-    lv_obj_align(time_label, LV_ALIGN_LEFT_MID, 10, 0);
-    lv_label_set_text(time_label, "Waiting for Wi-Fi...");
-    lv_timer_create(update_time_cb, 1000, NULL);
+    time_label_synth = lv_label_create(header);
+    lv_obj_set_style_text_font(time_label_synth, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(time_label_synth, lv_color_white(), 0);
+    lv_obj_align(time_label_synth, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_label_set_text(time_label_synth, "Waiting for Wi-Fi...");
+    
+    // Add Back Button
+    lv_obj_t * btn_back = lv_btn_create(header);
+    lv_obj_set_size(btn_back, 80, 40);
+    lv_obj_align(btn_back, LV_ALIGN_RIGHT_MID, -10, 0);
+    lv_obj_t * lbl_back = lv_label_create(btn_back);
+    lv_label_set_text(lbl_back, "Back");
+    lv_obj_center(lbl_back);
+    lv_obj_add_event_cb(btn_back, btn_go_menu_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t * title_label = lv_label_create(header);
     lv_obj_set_style_text_font(title_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(title_label, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_obj_align(title_label, LV_ALIGN_RIGHT_MID, -20, 0);
+    lv_obj_align(title_label, LV_ALIGN_CENTER, 0, 0); // Put title in center to make room for Back
     lv_label_set_text(title_label, "P4 NanoSynth");
 
     // Controls container
@@ -477,6 +619,14 @@ void app_main(void)
 
     // 6. Build the UI
     bsp_display_lock(0);
+    create_main_menu();
     create_synth_ui();
+    create_clock_screen();
+    
+    // Start global update timer
+    lv_timer_create(update_time_cb, 1000, NULL);
+    
+    // Load initial screen
+    lv_scr_load(main_menu_scr);
     bsp_display_unlock();
 }
