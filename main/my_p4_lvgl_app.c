@@ -389,7 +389,7 @@ static lv_color_t get_heatmap_color(float intensity) {
     if (intensity < 0.0f) intensity = 0.0f;
     if (intensity > 1.0f) intensity = 1.0f;
     uint8_t r = 0, g = 0, b = 0;
-    
+
     if (intensity < 0.25f) {
         float t = intensity / 0.25f;
         b = (uint8_t)(t * 255.0f);
@@ -495,7 +495,7 @@ static void btn_record_event_cb(lv_event_t * e) {
                 int chart_h = 240;
                 int chart_w = 640;
                 lv_canvas_fill_bg(record_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
-                
+
                 int step = rec_sample_count / chart_w;
                 if (step == 0) step = 1;
 
@@ -503,14 +503,14 @@ static void btn_record_event_cb(lv_event_t * e) {
                 float *vReal = malloc(FFT_SIZE * sizeof(float));
                 float *vImag = malloc(FFT_SIZE * sizeof(float));
                 float *mags  = malloc((FFT_SIZE / 2) * sizeof(float));
-                
+
                 if (vReal && vImag && mags) {
                     int num_bins = FFT_SIZE / 2;
                     float log_max = logf((float)(num_bins - 1));
 
                     for (int x = 0; x < chart_w; x++) {
                         int start_idx = x * step;
-                        
+
                         // Fill FFT buffer
                         for (int i = 0; i < FFT_SIZE; i++) {
                             if (start_idx + i < rec_sample_count && start_idx + i >= 0) {
@@ -522,11 +522,11 @@ static void btn_record_event_cb(lv_event_t * e) {
                             }
                             vImag[i] = 0.0f;
                         }
-                        
+
                         compute_fft(vReal, vImag, FFT_SIZE);
-                        
+
                         float max_mag = 0.0f;
-                        
+
                         for (int i = 0; i < num_bins; i++) {
                             float mag = sqrtf(vReal[i]*vReal[i] + vImag[i]*vImag[i]);
                             mags[i] = mag;
@@ -534,18 +534,18 @@ static void btn_record_event_cb(lv_event_t * e) {
                                 max_mag = mag;
                             }
                         }
-                        
-                        if (max_mag < 1000.0f) max_mag = 1000.0f; 
+
+                        if (max_mag < 1000.0f) max_mag = 1000.0f;
                         float scale = 1.0f / (max_mag * 0.7f);
-                        
+
                         for (int y = 0; y < chart_h; y++) {
                             float ratio = (float)(chart_h - 1 - y) / (float)(chart_h - 1);
                             float exact_bin = expf(ratio * log_max);
                             int bin = (int)exact_bin;
-                            
+
                             if (bin < 1) bin = 1;
                             if (bin >= num_bins) bin = num_bins - 1;
-                            
+
                             float intensity = mags[bin] * scale;
                             lv_color_t color = get_heatmap_color(intensity);
                             lv_canvas_set_px(record_canvas, x, y, color, LV_OPA_COVER);
@@ -555,7 +555,7 @@ static void btn_record_event_cb(lv_event_t * e) {
                     free(vImag);
                     free(mags);
                 }
-                
+
                 lv_obj_invalidate(record_canvas);
             }
         }
@@ -718,7 +718,7 @@ void create_record_screen(void)
     lv_obj_align(record_canvas, LV_ALIGN_BOTTOM_MID, 0, -40);
     lv_obj_set_style_border_color(record_canvas, lv_color_hex(0x555555), 0);
     lv_obj_set_style_border_width(record_canvas, 2, 0);
-    
+
     // Allocate the draw buffer for a 640x240 RGB565 canvas from PSRAM
     size_t canvas_size = 640 * 240 * 2;
     record_canvas_raw_buf = heap_caps_malloc(canvas_size + 128, MALLOC_CAP_SPIRAM);
