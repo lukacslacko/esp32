@@ -38,25 +38,39 @@
 // GLOBALS
 // ---------------------------------------------------------------------
 static esp_codec_dev_handle_t spk_codec_dev = NULL;
+static esp_codec_dev_handle_t mic_codec_dev = NULL;
+
 static lv_obj_t * time_label_synth;
 static lv_obj_t * time_label_menu;
+static lv_obj_t * time_label_record;
 
 static lv_obj_t * main_menu_scr;
 static lv_obj_t * synth_scr;
 static lv_obj_t * clock_scr;
+static lv_obj_t * record_scr;
 
 static lv_obj_t * clock_hour_hand;
 static lv_obj_t * clock_min_hand;
 static lv_obj_t * clock_sec_hand;
 
 // ---------------------------------------------------------------------
-// SYNTHESIS & AUDIO (POLYPHONIC + ADSR)
+// SYNTHESIS & AUDIO & RECORDING
 // ---------------------------------------------------------------------
 #include <math.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// Recording State
+#define REC_MAX_SEC 5
+#define REC_BUFFER_SAMPLES (SAMPLE_RATE * REC_MAX_SEC)
+static int16_t * rec_buffer = NULL;
+static volatile int rec_sample_count = 0;
+static volatile bool is_recording = false;
+static volatile bool is_playing_reverse = false;
+static volatile int rec_play_idx = 0;
+static volatile float rec_multiplier = 1.0f;
 
 #define MAX_VOICES 5
 
@@ -130,6 +144,42 @@ static void audio_task(void *pvParameters)
     float sample_rate_f = (float)SAMPLE_RATE;
 
     while (1) {
+        if (is_recording) {
+            if (mic_codec_dev && rec_buffer) {
+                esp_codec_dev_read(mic_codec_dev, audio_buffer, num_samples * sizeof(int16_t));
+                for(int i=0; i<num_samples; i++) {
+                    if (rec_sample_count < REC_BUFFER_SAMPLES) {
+                        rec_buffer[rec_sample_count++] = audio_buffer[i];
+                    }
+                }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            continue;
+        }
+
+        if (is_playing_reverse) {
+            if (!spk_codec_dev) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            for (size_t i = 0; i < num_samples; i++) {
+                if (rec_play_idx >= 0 && rec_buffer) {
+                    int32_t amplified_sample = (int32_t)(rec_buffer[rec_play_idx--] * rec_multiplier);
+                    if (amplified_sample > 32767) amplified_sample = 32767;
+                    else if (amplified_sample < -32768) amplified_sample = -32768;
+                    audio_buffer[i] = (int16_t)amplified_sample;
+                } else {
+                    audio_buffer[i] = 0;
+                    if (i == (num_samples - 1)) {
+                        is_playing_reverse = false;
+                    }
+                }
+            }
+            esp_codec_dev_write(spk_codec_dev, audio_buffer, num_samples * sizeof(int16_t));
+            continue;
+        }
+
         if (!spk_codec_dev) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -236,14 +286,17 @@ static void update_time_cb(lv_timer_t * timer)
         if (time_label_menu) {
             lv_label_set_text_fmt(time_label_menu, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
         }
-        
+        if (time_label_record) {
+            lv_label_set_text_fmt(time_label_record, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        }
+
         // Update analog clock if created
         if (clock_sec_hand) {
             int sec_angle = timeinfo.tm_sec * 60; // 360/60 * 10 = 60 (lvgl uses 0.1 degree units)
             lv_obj_set_style_transform_rotation(clock_sec_hand, sec_angle, 0);
         }
         if (clock_min_hand) {
-            int min_angle = timeinfo.tm_min * 60 + timeinfo.tm_sec; 
+            int min_angle = timeinfo.tm_min * 60 + timeinfo.tm_sec;
             lv_obj_set_style_transform_rotation(clock_min_hand, min_angle, 0);
         }
         if (clock_hour_hand) {
@@ -253,6 +306,7 @@ static void update_time_cb(lv_timer_t * timer)
     } else {
         if (time_label_synth) lv_label_set_text(time_label_synth, "Waiting for Wi-Fi...");
         if (time_label_menu) lv_label_set_text(time_label_menu, "Waiting for Wi-Fi...");
+        if (time_label_record) lv_label_set_text(time_label_record, "Waiting for Wi-Fi...");
     }
 }
 
@@ -320,8 +374,56 @@ static void btn_go_clock_cb(lv_event_t * e) {
     lv_scr_load(clock_scr);
 }
 
+static void btn_go_record_cb(lv_event_t * e) {
+    lv_scr_load(record_scr);
+}
+
 static void btn_go_menu_cb(lv_event_t * e) {
     lv_scr_load(main_menu_scr);
+}
+
+static void btn_record_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t * btn = lv_event_get_target(e);
+
+    if (code == LV_EVENT_PRESSED) {
+        lv_obj_set_style_bg_color(btn, lv_palette_main(LV_PALETTE_RED), 0);
+        rec_sample_count = 0;
+        is_playing_reverse = false;
+        is_recording = true;
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x555555), 0);
+        is_recording = false;
+        if (rec_sample_count > 0 && rec_buffer != NULL) {
+            // Calculate 99th percentile for volume auto-scaling
+            int bins[100] = {0};
+            for (int i = 0; i < rec_sample_count; i++) {
+                int val = rec_buffer[i];
+                if (val < 0) val = -val;
+                if (val > 32767) val = 32767;
+                int bin = (val * 100) / 32768; // 0 to 99
+                if (bin > 99) bin = 99;
+                if (bin < 0) bin = 0;
+                bins[bin]++;
+            }
+            int target_count = (rec_sample_count * 99) / 100;
+            int count = 0;
+            int p99_val = 32767;
+            for (int i = 0; i < 100; i++) {
+                count += bins[i];
+                if (count >= target_count) {
+                    p99_val = (i * 32768) / 100;
+                    break;
+                }
+            }
+            if (p99_val < 50) p99_val = 50; // Prevent infinite/massive gain on silence
+            rec_multiplier = 32760.0f / (float)p99_val;
+            if (rec_multiplier > 100.0f) rec_multiplier = 100.0f; // Cap max boost at 100x
+
+            rec_play_idx = rec_sample_count - 1;
+            is_playing_reverse = true;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -348,7 +450,7 @@ void create_main_menu(void)
 
     lv_obj_t * btn_synth = lv_btn_create(main_menu_scr);
     lv_obj_set_size(btn_synth, 200, 80);
-    lv_obj_align(btn_synth, LV_ALIGN_CENTER, 0, -60);
+    lv_obj_align(btn_synth, LV_ALIGN_CENTER, 0, -100);
     lv_obj_t * lbl_synth = lv_label_create(btn_synth);
     lv_label_set_text(lbl_synth, "NanoSynth");
     lv_obj_center(lbl_synth);
@@ -356,11 +458,19 @@ void create_main_menu(void)
 
     lv_obj_t * btn_clock = lv_btn_create(main_menu_scr);
     lv_obj_set_size(btn_clock, 200, 80);
-    lv_obj_align(btn_clock, LV_ALIGN_CENTER, 0, 60);
+    lv_obj_align(btn_clock, LV_ALIGN_CENTER, 0, 0);
     lv_obj_t * lbl_clock = lv_label_create(btn_clock);
     lv_label_set_text(lbl_clock, "Analog Clock");
     lv_obj_center(lbl_clock);
     lv_obj_add_event_cb(btn_clock, btn_go_clock_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t * btn_record = lv_btn_create(main_menu_scr);
+    lv_obj_set_size(btn_record, 200, 80);
+    lv_obj_align(btn_record, LV_ALIGN_CENTER, 0, 100);
+    lv_obj_t * lbl_record = lv_label_create(btn_record);
+    lv_label_set_text(lbl_record, "Reverse Recorder");
+    lv_obj_center(lbl_record);
+    lv_obj_add_event_cb(btn_record, btn_go_record_cb, LV_EVENT_CLICKED, NULL);
 }
 
 void create_clock_screen(void)
@@ -380,7 +490,7 @@ void create_clock_screen(void)
     lv_obj_t * face = lv_obj_create(clock_scr);
     lv_obj_set_size(face, 400, 400);
     lv_obj_align(face, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(face, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_radius(face, 200, 0);
     lv_obj_set_style_bg_color(face, lv_color_hex(0x222222), 0);
     lv_obj_set_style_border_color(face, lv_palette_main(LV_PALETTE_AMBER), 0);
     lv_obj_set_style_border_width(face, 5, 0);
@@ -391,7 +501,7 @@ void create_clock_screen(void)
     lv_obj_set_style_bg_color(clock_hour_hand, lv_color_white(), 0);
     lv_obj_align(clock_hour_hand, LV_ALIGN_CENTER, 0, -40); // Offset upwards so bottom is at center
     lv_obj_set_style_transform_pivot_x(clock_hour_hand, 4, 0);
-    lv_obj_set_style_transform_pivot_y(clock_hour_hand, 100, 0); // Pivot near the bottom 
+    lv_obj_set_style_transform_pivot_y(clock_hour_hand, 100, 0); // Pivot near the bottom
     lv_obj_set_style_border_width(clock_hour_hand, 0, 0);
 
     clock_min_hand = lv_obj_create(face);
@@ -410,13 +520,61 @@ void create_clock_screen(void)
     lv_obj_set_style_transform_pivot_y(clock_sec_hand, 170, 0); // Pivot near the bottom
     lv_obj_set_style_border_width(clock_sec_hand, 0, 0);
 
-    // Center dot
+// Center dot
     lv_obj_t * dot = lv_obj_create(face);
     lv_obj_set_size(dot, 16, 16);
     lv_obj_align(dot, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_radius(dot, 8, 0);
     lv_obj_set_style_bg_color(dot, lv_palette_main(LV_PALETTE_AMBER), 0);
     lv_obj_set_style_border_width(dot, 0, 0);
+}
+
+void create_record_screen(void)
+{
+    record_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(record_scr, lv_color_hex(0x222222), 0);
+
+    // Header container
+    lv_obj_t * header = lv_obj_create(record_scr);
+    lv_obj_set_size(header, LCD_H_RES, 60);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(header, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+
+    time_label_record = lv_label_create(header);
+    lv_obj_set_style_text_font(time_label_record, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(time_label_record, lv_color_white(), 0);
+    lv_obj_align(time_label_record, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_label_set_text(time_label_record, "Waiting for Wi-Fi...");
+
+    lv_obj_t * btn_back = lv_btn_create(header);
+    lv_obj_set_size(btn_back, 80, 40);
+    lv_obj_align(btn_back, LV_ALIGN_RIGHT_MID, -10, 0);
+    lv_obj_t * lbl_back = lv_label_create(btn_back);
+    lv_label_set_text(lbl_back, "Back");
+    lv_obj_center(lbl_back);
+    lv_obj_add_event_cb(btn_back, btn_go_menu_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * title_label = lv_label_create(header);
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title_label, lv_palette_main(LV_PALETTE_AMBER), 0);
+    lv_obj_align(title_label, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(title_label, "Reverse Recorder");
+
+    // Central Record Button
+    lv_obj_t * btn_rec = lv_btn_create(record_scr);
+    lv_obj_set_size(btn_rec, 300, 300);
+    lv_obj_align(btn_rec, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(btn_rec, 150, 0);
+    lv_obj_set_style_shadow_width(btn_rec, 0, 0);
+    lv_obj_set_style_shadow_width(btn_rec, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(btn_rec, lv_color_hex(0x555555), 0);
+    lv_obj_add_event_cb(btn_rec, btn_record_event_cb, LV_EVENT_ALL, NULL);
+
+    lv_obj_t * lbl_rec = lv_label_create(btn_rec);
+    lv_obj_set_style_text_font(lbl_rec, &lv_font_montserrat_14, 0);
+    lv_label_set_text(lbl_rec, "HOLD TO RECORD");
+    lv_obj_center(lbl_rec);
 }
 
 void create_synth_ui(void)
@@ -438,7 +596,7 @@ void create_synth_ui(void)
     lv_obj_set_style_text_color(time_label_synth, lv_color_white(), 0);
     lv_obj_align(time_label_synth, LV_ALIGN_LEFT_MID, 10, 0);
     lv_label_set_text(time_label_synth, "Waiting for Wi-Fi...");
-    
+
     // Add Back Button
     lv_obj_t * btn_back = lv_btn_create(header);
     lv_obj_set_size(btn_back, 80, 40);
@@ -585,7 +743,19 @@ void app_main(void)
             esp_codec_dev_open(spk_codec_dev, &fs);
             esp_codec_dev_set_out_vol(spk_codec_dev, 70);
         }
+        
+        mic_codec_dev = bsp_audio_codec_microphone_init();
+        if (mic_codec_dev) {
+            esp_codec_dev_sample_info_t fs_mic = {
+                .sample_rate = SAMPLE_RATE,
+                .channel = 1,
+                .bits_per_sample = 16,
+            };
+            esp_codec_dev_open(mic_codec_dev, &fs_mic);
+        }
     }
+
+    rec_buffer = malloc(REC_BUFFER_SAMPLES * sizeof(int16_t));
 
     // 3. Wi-Fi Initialization (Over SDIO to the C6)
     ESP_ERROR_CHECK(esp_netif_init());
@@ -622,10 +792,11 @@ void app_main(void)
     create_main_menu();
     create_synth_ui();
     create_clock_screen();
-    
+    create_record_screen();
+
     // Start global update timer
     lv_timer_create(update_time_cb, 1000, NULL);
-    
+
     // Load initial screen
     lv_scr_load(main_menu_scr);
     bsp_display_unlock();
