@@ -15,6 +15,10 @@
 #include "esp_netif.h"
 #include "esp_sntp.h"
 
+// ADC & GPIO
+#include "esp_adc/adc_oneshot.h"
+#include "driver/gpio.h"
+
 // Check if the secrets file exists before trying to include it
 #if __has_include("secrets.h")
     #include "secrets.h"
@@ -86,6 +90,16 @@ static lv_obj_t * weather_temp_label  = NULL;
 static lv_obj_t * weather_press_label = NULL;
 static lv_obj_t * weather_status_label= NULL;
 static lv_obj_t * time_label_weather  = NULL;
+
+// Joystick screen widgets
+static lv_obj_t * joystick_scr        = NULL;
+static lv_obj_t * joystick_x_label    = NULL;
+static lv_obj_t * joystick_y_label    = NULL;
+static lv_obj_t * joystick_sw_label   = NULL;
+static lv_obj_t * joystick_dot        = NULL;
+static lv_obj_t * time_label_joystick = NULL;
+static adc_oneshot_unit_handle_t joystick_adc_handle = NULL;
+static bool joystick_adc_init = false;
 
 // ---------------------------------------------------------------------
 // SYNTHESIS & AUDIO & RECORDING
@@ -326,6 +340,9 @@ static void update_time_cb(lv_timer_t * timer)
         if (time_label_weather) {
             lv_label_set_text_fmt(time_label_weather, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
         }
+        if (time_label_joystick) {
+            lv_label_set_text_fmt(time_label_joystick, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        }
 
         // Update analog clock if created
         if (clock_sec_hand) {
@@ -345,6 +362,7 @@ static void update_time_cb(lv_timer_t * timer)
         if (time_label_menu)    lv_label_set_text(time_label_menu,    "Waiting for Wi-Fi...");
         if (time_label_record)  lv_label_set_text(time_label_record,  "Waiting for Wi-Fi...");
         if (time_label_weather) lv_label_set_text(time_label_weather, "Waiting for Wi-Fi...");
+        if (time_label_joystick) lv_label_set_text(time_label_joystick, "Waiting for Wi-Fi...");
     }
 }
 
@@ -422,6 +440,10 @@ static void btn_go_menu_cb(lv_event_t * e) {
 
 static void btn_go_weather_cb(lv_event_t * e) {
     lv_scr_load(weather_scr);
+}
+
+static void btn_go_joystick_cb(lv_event_t * e) {
+    lv_scr_load(joystick_scr);
 }
 
 static lv_color_t get_heatmap_color(float intensity) {
@@ -839,6 +861,132 @@ void create_weather_screen(void)
     lv_timer_create(update_weather_cb, 2000, NULL);
 }
 
+// ---------------------------------------------------------------------
+// JOYSTICK SCREEN
+// ---------------------------------------------------------------------
+
+static void update_joystick_cb(lv_timer_t * timer)
+{
+    if (!joystick_adc_init || !joystick_x_label) return;
+
+    int x_val = 0;
+    int y_val = 0;
+
+    // Read X
+    adc_oneshot_read(joystick_adc_handle, ADC_CHANNEL_4, &x_val);
+    // Read Y
+    adc_oneshot_read(joystick_adc_handle, ADC_CHANNEL_5, &y_val);
+
+    // Read SW
+    int sw_val = gpio_get_level(GPIO_NUM_22);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "X: %d", x_val);
+    lv_label_set_text(joystick_x_label, buf);
+
+    snprintf(buf, sizeof(buf), "Y: %d", y_val);
+    lv_label_set_text(joystick_y_label, buf);
+
+    snprintf(buf, sizeof(buf), "BTN: %s", sw_val == 0 ? "PRESSED" : "RELEASED");
+    lv_label_set_text(joystick_sw_label, buf);
+
+    if (joystick_dot) {
+        int dx = ((x_val - 2048) * 150) / 2048;
+        int dy = ((y_val - 2048) * 150) / 2048;
+        lv_obj_align(joystick_dot, LV_ALIGN_CENTER, dx, dy);
+    }
+}
+
+void init_joystick_hw(void)
+{
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+        .clk_src = ADC_RTC_CLK_SRC_DEFAULT,
+    };
+    if (adc_oneshot_new_unit(&init_config1, &joystick_adc_handle) == ESP_OK) {
+        adc_oneshot_chan_cfg_t config = {
+            .bitwidth = ADC_BITWIDTH_12,
+            .atten = ADC_ATTEN_DB_12,
+        };
+        adc_oneshot_config_channel(joystick_adc_handle, ADC_CHANNEL_4, &config);
+        adc_oneshot_config_channel(joystick_adc_handle, ADC_CHANNEL_5, &config);
+        joystick_adc_init = true;
+    }
+
+    // Switch pin
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << GPIO_NUM_22),
+        .pull_down_en = 0,
+        .pull_up_en = 1
+    };
+    gpio_config(&io_conf);
+}
+
+void create_joystick_screen(void)
+{
+    joystick_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(joystick_scr, lv_color_hex(0x1a1a1a), 0);
+
+    // Header bar
+    lv_obj_t * header = lv_obj_create(joystick_scr);
+    lv_obj_set_size(header, LCD_H_RES, 60);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(header, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+
+    time_label_joystick = lv_label_create(header);
+    lv_obj_set_style_text_font(time_label_joystick, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(time_label_joystick, lv_color_white(), 0);
+    lv_obj_align(time_label_joystick, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_label_set_text(time_label_joystick, "Waiting for Wi-Fi...");
+
+    lv_obj_t * btn_back = lv_btn_create(header);
+    lv_obj_set_size(btn_back, 80, 40);
+    lv_obj_align(btn_back, LV_ALIGN_RIGHT_MID, -10, 0);
+    lv_obj_t * lbl_back = lv_label_create(btn_back);
+    lv_label_set_text(lbl_back, "Back");
+    lv_obj_center(lbl_back);
+    lv_obj_add_event_cb(btn_back, btn_go_menu_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * title_label = lv_label_create(header);
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title_label, lv_palette_main(LV_PALETTE_YELLOW), 0);
+    lv_obj_align(title_label, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(title_label, "Joystick Test (ADC)");
+
+    joystick_x_label = lv_label_create(joystick_scr);
+    lv_obj_set_style_text_color(joystick_x_label, lv_color_white(), 0);
+    lv_obj_align(joystick_x_label, LV_ALIGN_TOP_LEFT, 20, 80);
+    lv_label_set_text(joystick_x_label, "X: 0");
+
+    joystick_y_label = lv_label_create(joystick_scr);
+    lv_obj_set_style_text_color(joystick_y_label, lv_color_white(), 0);
+    lv_obj_align(joystick_y_label, LV_ALIGN_TOP_LEFT, 150, 80);
+    lv_label_set_text(joystick_y_label, "Y: 0");
+
+    joystick_sw_label = lv_label_create(joystick_scr);
+    lv_obj_set_style_text_color(joystick_sw_label, lv_color_white(), 0);
+    lv_obj_align(joystick_sw_label, LV_ALIGN_TOP_LEFT, 280, 80);
+    lv_label_set_text(joystick_sw_label, "BTN: RELEASED");
+
+    lv_obj_t * map_frame = lv_obj_create(joystick_scr);
+    lv_obj_set_size(map_frame, 320, 320);
+    lv_obj_align(map_frame, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_set_style_bg_color(map_frame, lv_color_hex(0x222222), 0);
+    lv_obj_set_style_border_color(map_frame, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_set_style_border_width(map_frame, 2, 0);
+
+    joystick_dot = lv_obj_create(map_frame);
+    lv_obj_set_size(joystick_dot, 20, 20);
+    lv_obj_set_style_radius(joystick_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(joystick_dot, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_obj_set_style_border_width(joystick_dot, 0, 0);
+    lv_obj_align(joystick_dot, LV_ALIGN_CENTER, 0, 0);
+
+    lv_timer_create(update_joystick_cb, 50, NULL);
+}
+
 void create_main_menu(void)
 {
     main_menu_scr = lv_obj_create(NULL);
@@ -889,6 +1037,14 @@ void create_main_menu(void)
     lv_label_set_text(lbl_weather, "Weather Station");
     lv_obj_center(lbl_weather);
     lv_obj_add_event_cb(btn_weather, btn_go_weather_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * btn_joystick = lv_btn_create(main_menu_scr);
+    lv_obj_set_size(btn_joystick, 200, 80);
+    lv_obj_align(btn_joystick, LV_ALIGN_CENTER, 0, 160);
+    lv_obj_t * lbl_joystick = lv_label_create(btn_joystick);
+    lv_label_set_text(lbl_joystick, "Joystick Test");
+    lv_obj_center(lbl_joystick);
+    lv_obj_add_event_cb(btn_joystick, btn_go_joystick_cb, LV_EVENT_CLICKED, NULL);
 }
 
 void create_clock_screen(void)
@@ -1231,6 +1387,8 @@ void app_main(void)
     create_clock_screen();
     create_record_screen();
     create_weather_screen();
+    init_joystick_hw();
+    create_joystick_screen();
 
     // Start global update timer
     lv_timer_create(update_time_cb, 1000, NULL);
