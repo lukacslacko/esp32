@@ -34,6 +34,15 @@
 #define BOOP_FREQ_HZ    400
 #define BOOP_DURATION   100
 
+// BMP280 Sensor
+#define BMP280_I2C_ADDR      0x77
+#define BMP280_REG_CHIP_ID   0xD0
+#define BMP280_REG_RESET     0xE0
+#define BMP280_REG_CTRL_MEAS 0xF4
+#define BMP280_REG_CONFIG    0xF5
+#define BMP280_REG_PRESS_MSB 0xF7
+#define BMP280_REG_CALIB00   0x88
+
 // ---------------------------------------------------------------------
 // GLOBALS
 // ---------------------------------------------------------------------
@@ -55,6 +64,28 @@ static uint8_t * record_canvas_aligned_buf = NULL;
 static lv_obj_t * clock_hour_hand;
 static lv_obj_t * clock_min_hand;
 static lv_obj_t * clock_sec_hand;
+
+// BMP280 sensor state
+static i2c_master_dev_handle_t bmp280_dev = NULL;
+static volatile float bmp280_temperature  = 0.0f;
+static volatile float bmp280_pressure     = 0.0f;
+static volatile bool  bmp280_ok           = false;
+
+// BMP280 calibration registers
+static uint16_t bmp280_dig_T1;
+static int16_t  bmp280_dig_T2, bmp280_dig_T3;
+static uint16_t bmp280_dig_P1;
+static int16_t  bmp280_dig_P2, bmp280_dig_P3, bmp280_dig_P4;
+static int16_t  bmp280_dig_P5, bmp280_dig_P6, bmp280_dig_P7;
+static int16_t  bmp280_dig_P8, bmp280_dig_P9;
+static int32_t  bmp280_t_fine;
+
+// Weather screen widgets
+static lv_obj_t * weather_scr         = NULL;
+static lv_obj_t * weather_temp_label  = NULL;
+static lv_obj_t * weather_press_label = NULL;
+static lv_obj_t * weather_status_label= NULL;
+static lv_obj_t * time_label_weather  = NULL;
 
 // ---------------------------------------------------------------------
 // SYNTHESIS & AUDIO & RECORDING
@@ -292,6 +323,9 @@ static void update_time_cb(lv_timer_t * timer)
         if (time_label_record) {
             lv_label_set_text_fmt(time_label_record, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
         }
+        if (time_label_weather) {
+            lv_label_set_text_fmt(time_label_weather, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        }
 
         // Update analog clock if created
         if (clock_sec_hand) {
@@ -307,9 +341,10 @@ static void update_time_cb(lv_timer_t * timer)
             lv_obj_set_style_transform_rotation(clock_hour_hand, hour_angle, 0);
         }
     } else {
-        if (time_label_synth) lv_label_set_text(time_label_synth, "Waiting for Wi-Fi...");
-        if (time_label_menu) lv_label_set_text(time_label_menu, "Waiting for Wi-Fi...");
-        if (time_label_record) lv_label_set_text(time_label_record, "Waiting for Wi-Fi...");
+        if (time_label_synth)   lv_label_set_text(time_label_synth,   "Waiting for Wi-Fi...");
+        if (time_label_menu)    lv_label_set_text(time_label_menu,    "Waiting for Wi-Fi...");
+        if (time_label_record)  lv_label_set_text(time_label_record,  "Waiting for Wi-Fi...");
+        if (time_label_weather) lv_label_set_text(time_label_weather, "Waiting for Wi-Fi...");
     }
 }
 
@@ -385,6 +420,10 @@ static void btn_go_menu_cb(lv_event_t * e) {
     lv_scr_load(main_menu_scr);
 }
 
+static void btn_go_weather_cb(lv_event_t * e) {
+    lv_scr_load(weather_scr);
+}
+
 static lv_color_t get_heatmap_color(float intensity) {
     if (intensity < 0.0f) intensity = 0.0f;
     if (intensity > 1.0f) intensity = 1.0f;
@@ -447,6 +486,123 @@ static void compute_fft(float *vReal, float *vImag, uint16_t n) {
             uImag = uReal * s + uImag * c;
             uReal = tempReal;
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// BMP280 DRIVER
+// ---------------------------------------------------------------------
+
+static esp_err_t bmp280_read(uint8_t reg, uint8_t *buf, size_t len)
+{
+    return i2c_master_transmit_receive(bmp280_dev, &reg, 1, buf, len, 100);
+}
+
+static esp_err_t bmp280_write(uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = { reg, val };
+    return i2c_master_transmit(bmp280_dev, buf, 2, 100);
+}
+
+// BMP280 compensation formulas (integer, from Bosch datasheet appendix)
+static float bmp280_comp_temp(int32_t adc_T)
+{
+    int32_t var1 = ((((adc_T >> 3) - ((int32_t)bmp280_dig_T1 << 1))) * (int32_t)bmp280_dig_T2) >> 11;
+    int32_t var2 = (((((adc_T >> 4) - (int32_t)bmp280_dig_T1) *
+                      ((adc_T >> 4) - (int32_t)bmp280_dig_T1)) >> 12) *
+                    (int32_t)bmp280_dig_T3) >> 14;
+    bmp280_t_fine = var1 + var2;
+    return (float)((bmp280_t_fine * 5 + 128) >> 8) / 100.0f;
+}
+
+static float bmp280_comp_press(int32_t adc_P)
+{
+    int64_t var1 = (int64_t)bmp280_t_fine - 128000;
+    int64_t var2 = var1 * var1 * (int64_t)bmp280_dig_P6;
+    var2 += (var1 * (int64_t)bmp280_dig_P5) << 17;
+    var2 += (int64_t)bmp280_dig_P4 << 35;
+    var1  = ((var1 * var1 * (int64_t)bmp280_dig_P3) >> 8) + ((var1 * (int64_t)bmp280_dig_P2) << 12);
+    var1  = (((int64_t)1 << 47) + var1) * (int64_t)bmp280_dig_P1 >> 33;
+    if (var1 == 0) return 0.0f;
+    int64_t p = 1048576 - adc_P;
+    p = (((p << 31) - var2) * 3125) / var1;
+    var1 = ((int64_t)bmp280_dig_P9 * (p >> 13) * (p >> 13)) >> 25;
+    var2 = ((int64_t)bmp280_dig_P8 * p) >> 19;
+    p = ((p + var1 + var2) >> 8) + ((int64_t)bmp280_dig_P7 << 4);
+    return (float)p / 25600.0f;   // hPa
+}
+
+static void bmp280_task(void *arg)
+{
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (!bus) {
+        printf("BMP280: I2C bus handle not available\n");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = BMP280_I2C_ADDR,
+        .scl_speed_hz    = 400000,
+    };
+    if (i2c_master_bus_add_device(bus, &dev_cfg, &bmp280_dev) != ESP_OK) {
+        printf("BMP280: Failed to add device to I2C bus\n");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Verify chip ID (BMP280 = 0x58, BME280 = 0x60)
+    uint8_t chip_id = 0;
+    if (bmp280_read(BMP280_REG_CHIP_ID, &chip_id, 1) != ESP_OK || chip_id != 0x58) {
+        printf("BMP280: Unexpected chip ID 0x%02X (expected 0x58) - check wiring & address\n", chip_id);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Soft reset, then wait for the sensor to come back up
+    bmp280_write(BMP280_REG_RESET, 0xB6);
+    vTaskDelay(pdMS_TO_TICKS(15));
+
+    // Read 24 bytes of calibration data starting at 0x88
+    uint8_t calib[24];
+    if (bmp280_read(BMP280_REG_CALIB00, calib, 24) != ESP_OK) {
+        printf("BMP280: Failed to read calibration data\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    bmp280_dig_T1 = (uint16_t)(calib[1]  << 8 | calib[0]);
+    bmp280_dig_T2 = (int16_t) (calib[3]  << 8 | calib[2]);
+    bmp280_dig_T3 = (int16_t) (calib[5]  << 8 | calib[4]);
+    bmp280_dig_P1 = (uint16_t)(calib[7]  << 8 | calib[6]);
+    bmp280_dig_P2 = (int16_t) (calib[9]  << 8 | calib[8]);
+    bmp280_dig_P3 = (int16_t) (calib[11] << 8 | calib[10]);
+    bmp280_dig_P4 = (int16_t) (calib[13] << 8 | calib[12]);
+    bmp280_dig_P5 = (int16_t) (calib[15] << 8 | calib[14]);
+    bmp280_dig_P6 = (int16_t) (calib[17] << 8 | calib[16]);
+    bmp280_dig_P7 = (int16_t) (calib[19] << 8 | calib[18]);
+    bmp280_dig_P8 = (int16_t) (calib[21] << 8 | calib[20]);
+    bmp280_dig_P9 = (int16_t) (calib[23] << 8 | calib[22]);
+
+    // Normal mode: osrs_t=x2 (010), osrs_p=x16 (101), mode=normal (11) -> 0101 0111 = 0x57
+    bmp280_write(BMP280_REG_CTRL_MEAS, 0x57);
+    // t_sb=1000ms (101), filter=x16 (100), spi3w=0 -> 1011 0000 = 0xB0
+    bmp280_write(BMP280_REG_CONFIG, 0xB0);
+
+    bmp280_ok = true;
+    printf("BMP280: Initialized OK at address 0x%02X\n", BMP280_I2C_ADDR);
+
+    while (1) {
+        // Read 6 bytes: press[2:0] then temp[2:0], all 20-bit MSB-first with 4-bit XLSB
+        uint8_t data[6];
+        if (bmp280_read(BMP280_REG_PRESS_MSB, data, 6) == ESP_OK) {
+            int32_t adc_P = (int32_t)((data[0] << 12) | (data[1] << 4) | (data[2] >> 4));
+            int32_t adc_T = (int32_t)((data[3] << 12) | (data[4] << 4) | (data[5] >> 4));
+            // Temperature must be computed first to populate bmp280_t_fine for pressure
+            bmp280_temperature = bmp280_comp_temp(adc_T);
+            bmp280_pressure    = bmp280_comp_press(adc_P);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
 
@@ -566,6 +722,123 @@ static void btn_record_event_cb(lv_event_t * e) {
 // UI SETUP
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// WEATHER SCREEN
+// ---------------------------------------------------------------------
+
+static void update_weather_cb(lv_timer_t * timer)
+{
+    if (!weather_temp_label || !weather_press_label) return;
+    if (bmp280_ok) {
+        char tbuf[16], pbuf[16];
+        snprintf(tbuf, sizeof(tbuf), "%.1f", (float)bmp280_temperature);
+        snprintf(pbuf, sizeof(pbuf), "%.1f", (float)bmp280_pressure);
+        lv_label_set_text(weather_temp_label,  tbuf);
+        lv_label_set_text(weather_press_label, pbuf);
+        if (weather_status_label) lv_label_set_text(weather_status_label, "");
+    } else {
+        lv_label_set_text(weather_temp_label,  "--.-");
+        lv_label_set_text(weather_press_label, "---.-");
+        if (weather_status_label) lv_label_set_text(weather_status_label, "Sensor error - check wiring (GPIO7=SDA, GPIO8=SCL)");
+    }
+}
+
+static lv_obj_t * make_sensor_card(lv_obj_t *parent, int x_ofs, lv_color_t border_col,
+                                   lv_color_t bg_col, const char *title_text,
+                                   lv_obj_t **value_label_out, const char *unit_text)
+{
+    lv_obj_t * card = lv_obj_create(parent);
+    lv_obj_set_size(card, 305, 290);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, x_ofs, 90);
+    lv_obj_set_style_bg_color(card, bg_col, 0);
+    lv_obj_set_style_border_color(card, border_col, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 20, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Card title (e.g. "TEMPERATURE")
+    lv_obj_t * title = lv_label_create(card);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, border_col, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+    lv_label_set_text(title, title_text);
+
+    // Big numeric value
+    lv_obj_t * val = lv_label_create(card);
+    lv_obj_set_style_text_font(val, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(val, lv_color_white(), 0);
+    lv_obj_align(val, LV_ALIGN_CENTER, 0, -10);
+    lv_label_set_text(val, "--.-");
+    *value_label_out = val;
+
+    // Unit label (e.g. "°C" or "hPa")
+    lv_obj_t * unit = lv_label_create(card);
+    lv_obj_set_style_text_font(unit, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(unit, lv_color_hex(0xaaaaaa), 0);
+    lv_obj_align(unit, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_label_set_text(unit, unit_text);
+
+    return card;
+}
+
+void create_weather_screen(void)
+{
+    weather_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(weather_scr, lv_color_hex(0x0d1b2a), 0);
+
+    // Header bar
+    lv_obj_t * header = lv_obj_create(weather_scr);
+    lv_obj_set_size(header, LCD_H_RES, 60);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(header, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+
+    time_label_weather = lv_label_create(header);
+    lv_obj_set_style_text_font(time_label_weather, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(time_label_weather, lv_color_white(), 0);
+    lv_obj_align(time_label_weather, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_label_set_text(time_label_weather, "Waiting for Wi-Fi...");
+
+    lv_obj_t * title_label = lv_label_create(header);
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title_label, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_obj_align(title_label, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(title_label, "Weather Station");
+
+    lv_obj_t * btn_back = lv_btn_create(header);
+    lv_obj_set_size(btn_back, 80, 40);
+    lv_obj_align(btn_back, LV_ALIGN_RIGHT_MID, -10, 0);
+    lv_obj_t * lbl_back = lv_label_create(btn_back);
+    lv_label_set_text(lbl_back, "Back");
+    lv_obj_center(lbl_back);
+    lv_obj_add_event_cb(btn_back, btn_go_menu_cb, LV_EVENT_CLICKED, NULL);
+
+    // Temperature card (left)
+    make_sensor_card(weather_scr, -183,
+                     lv_palette_main(LV_PALETTE_CYAN),
+                     lv_color_hex(0x0a2030),
+                     "TEMPERATURE",
+                     &weather_temp_label,
+                     "\xc2\xb0""C");   // UTF-8 degree symbol
+
+    // Pressure card (right)
+    make_sensor_card(weather_scr, +183,
+                     lv_palette_main(LV_PALETTE_GREEN),
+                     lv_color_hex(0x0a2018),
+                     "PRESSURE",
+                     &weather_press_label,
+                     "hPa");
+
+    // Status / error label at the bottom
+    weather_status_label = lv_label_create(weather_scr);
+    lv_obj_set_style_text_font(weather_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(weather_status_label, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_obj_align(weather_status_label, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_label_set_text(weather_status_label, "Initializing sensor...");
+
+    lv_timer_create(update_weather_cb, 2000, NULL);
+}
+
 void create_main_menu(void)
 {
     main_menu_scr = lv_obj_create(NULL);
@@ -584,9 +857,10 @@ void create_main_menu(void)
     lv_obj_align(time_label_menu, LV_ALIGN_TOP_MID, 0, 60);
     lv_label_set_text(time_label_menu, "Waiting for Wi-Fi...");
 
+    // 2×2 button grid
     lv_obj_t * btn_synth = lv_btn_create(main_menu_scr);
     lv_obj_set_size(btn_synth, 200, 80);
-    lv_obj_align(btn_synth, LV_ALIGN_CENTER, 0, -100);
+    lv_obj_align(btn_synth, LV_ALIGN_CENTER, -155, -55);
     lv_obj_t * lbl_synth = lv_label_create(btn_synth);
     lv_label_set_text(lbl_synth, "NanoSynth");
     lv_obj_center(lbl_synth);
@@ -594,7 +868,7 @@ void create_main_menu(void)
 
     lv_obj_t * btn_clock = lv_btn_create(main_menu_scr);
     lv_obj_set_size(btn_clock, 200, 80);
-    lv_obj_align(btn_clock, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(btn_clock, LV_ALIGN_CENTER, 155, -55);
     lv_obj_t * lbl_clock = lv_label_create(btn_clock);
     lv_label_set_text(lbl_clock, "Analog Clock");
     lv_obj_center(lbl_clock);
@@ -602,11 +876,19 @@ void create_main_menu(void)
 
     lv_obj_t * btn_record = lv_btn_create(main_menu_scr);
     lv_obj_set_size(btn_record, 200, 80);
-    lv_obj_align(btn_record, LV_ALIGN_CENTER, 0, 100);
+    lv_obj_align(btn_record, LV_ALIGN_CENTER, -155, 55);
     lv_obj_t * lbl_record = lv_label_create(btn_record);
     lv_label_set_text(lbl_record, "Reverse Recorder");
     lv_obj_center(lbl_record);
     lv_obj_add_event_cb(btn_record, btn_go_record_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * btn_weather = lv_btn_create(main_menu_scr);
+    lv_obj_set_size(btn_weather, 200, 80);
+    lv_obj_align(btn_weather, LV_ALIGN_CENTER, 155, 55);
+    lv_obj_t * lbl_weather = lv_label_create(btn_weather);
+    lv_label_set_text(lbl_weather, "Weather Station");
+    lv_obj_center(lbl_weather);
+    lv_obj_add_event_cb(btn_weather, btn_go_weather_cb, LV_EVENT_CLICKED, NULL);
 }
 
 void create_clock_screen(void)
@@ -939,12 +1221,16 @@ void app_main(void)
     // 5. Start Audio Task
     xTaskCreate(audio_task, "audio_task", 4096, NULL, 5, NULL);
 
+    // Start BMP280 sensor task (I2C bus is ready after bsp_display_start)
+    xTaskCreate(bmp280_task, "bmp280_task", 4096, NULL, 3, NULL);
+
     // 6. Build the UI
     bsp_display_lock(0);
     create_main_menu();
     create_synth_ui();
     create_clock_screen();
     create_record_screen();
+    create_weather_screen();
 
     // Start global update timer
     lv_timer_create(update_time_cb, 1000, NULL);

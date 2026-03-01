@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:sensorkit.joy-it.net)",
+      "WebFetch(domain:www.waveshare.com)",
+      "WebSearch",
+      "WebFetch(domain:files.waveshare.com)"
+    ]
+  }
+}
