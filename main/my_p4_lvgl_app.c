@@ -19,6 +19,9 @@
 #include "esp_adc/adc_oneshot.h"
 #include "driver/gpio.h"
 
+// Notes App
+#include "notes_app.h"
+
 // Check if the secrets file exists before trying to include it
 #if __has_include("secrets.h")
     #include "secrets.h"
@@ -1040,11 +1043,19 @@ void create_main_menu(void)
 
     lv_obj_t * btn_joystick = lv_btn_create(main_menu_scr);
     lv_obj_set_size(btn_joystick, 200, 80);
-    lv_obj_align(btn_joystick, LV_ALIGN_CENTER, 0, 160);
+    lv_obj_align(btn_joystick, LV_ALIGN_CENTER, -110, 160);
     lv_obj_t * lbl_joystick = lv_label_create(btn_joystick);
     lv_label_set_text(lbl_joystick, "Joystick Test");
     lv_obj_center(lbl_joystick);
     lv_obj_add_event_cb(btn_joystick, btn_go_joystick_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * btn_notes = lv_btn_create(main_menu_scr);
+    lv_obj_set_size(btn_notes, 200, 80);
+    lv_obj_align(btn_notes, LV_ALIGN_CENTER, 110, 160);
+    lv_obj_t * lbl_notes = lv_label_create(btn_notes);
+    lv_label_set_text(lbl_notes, "Notes App");
+    lv_obj_center(lbl_notes);
+    lv_obj_add_event_cb(btn_notes, btn_go_notes_cb, LV_EVENT_CLICKED, NULL);
 }
 
 void create_clock_screen(void)
@@ -1389,6 +1400,7 @@ void app_main(void)
     create_weather_screen();
     init_joystick_hw();
     create_joystick_screen();
+    create_notes_screens(main_menu_scr, btn_go_menu_cb);
 
     // Start global update timer
     lv_timer_create(update_time_cb, 1000, NULL);

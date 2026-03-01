@@ -13,3 +13,11 @@ If you are using the KY-023 Joystick module with the Joystick test app, please w
 * **VRx**: Connect to **GPIO 20** (ADC1 Channel 4)
 * **VRy**: Connect to **GPIO 21** (ADC1 Channel 5)
 * **SW**: Connect to **GPIO 22** (configured with an internal pull-up in the software)
+
+## Notes App
+The ESP32-P4 Launchpad feature includes a "Quick Notes" app on the home menu!
+* Tap `+ New Note` to create a new canvas.
+* You can smoothly write across the screen using your finger to draw vectors.
+* Press `Done` at the top right to save and view your note as a thumbnail.
+* Tap any note thumbnail to reopen it and continue drawing your masterpiece.
+* **Long press** any note thumbnail to bring up the delete dialog to toss it.
