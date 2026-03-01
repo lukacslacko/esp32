@@ -2,6 +2,8 @@
 #include "esp_heap_caps.h"
 #include <stdio.h>
 #include <string.h>
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #define MAX_NOTES 10
 #define MAX_STROKES_PER_NOTE 100
@@ -38,8 +40,150 @@ static lv_obj_t * main_menu_scr_ptr = NULL;
 static bool is_drawing = false;
 static note_stroke_t * current_stroke = NULL;
 
+static lv_color_t active_color;
+static uint16_t active_width = 5;
+static bool is_eraser = false;
+
 static void render_thumbnails(void);
 static void open_note_edit(int idx);
+
+static void save_notes_to_nvs(void) {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open("notes_storage", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) return;
+
+    size_t required_size = sizeof(uint32_t); // Format version
+
+    // First, calculate total size required
+    for (int i = 0; i < MAX_NOTES; i++) {
+        required_size += sizeof(bool); // in_use
+        if (notes_db[i].in_use) {
+            required_size += sizeof(uint32_t); // stroke_cnt
+            for (uint32_t s = 0; s < notes_db[i].stroke_cnt; s++) {
+                required_size += sizeof(uint32_t); // point_cnt
+                required_size += sizeof(uint16_t); // width
+                required_size += 3; // R, G, B colors
+                required_size += notes_db[i].strokes[s].point_cnt * sizeof(lv_point_precise_t);
+            }
+        }
+    }
+
+    uint8_t * blob = heap_caps_malloc(required_size, MALLOC_CAP_SPIRAM);
+    if (!blob) {
+        nvs_close(my_handle);
+        return;
+    }
+
+    uint8_t * ptr = blob;
+    uint32_t version = 2;
+    memcpy(ptr, &version, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+
+    for (int i = 0; i < MAX_NOTES; i++) {
+        bool in_use = notes_db[i].in_use;
+        memcpy(ptr, &in_use, sizeof(bool)); ptr += sizeof(bool);
+
+        if (in_use) {
+            uint32_t sc = notes_db[i].stroke_cnt;
+            memcpy(ptr, &sc, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+
+            for (uint32_t s = 0; s < sc; s++) {
+                uint32_t pc = notes_db[i].strokes[s].point_cnt;
+                memcpy(ptr, &pc, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+
+                uint16_t w = notes_db[i].strokes[s].width;
+                memcpy(ptr, &w, sizeof(uint16_t)); ptr += sizeof(uint16_t);
+
+                lv_color_t c = notes_db[i].strokes[s].color;
+                *ptr++ = c.red;
+                *ptr++ = c.green;
+                *ptr++ = c.blue;
+
+                size_t points_size = pc * sizeof(lv_point_precise_t);
+                memcpy(ptr, notes_db[i].strokes[s].points, points_size); ptr += points_size;
+            }
+        }
+    }
+
+    nvs_set_blob(my_handle, "notes_blob", blob, required_size);
+    nvs_commit(my_handle);
+    nvs_close(my_handle);
+    heap_caps_free(blob);
+}
+
+static void load_notes_from_nvs(void) {
+    nvs_handle_t my_handle;
+    esp_err_t err = nvs_open("notes_storage", NVS_READONLY, &my_handle);
+    if (err != ESP_OK) return;
+
+    size_t required_size = 0;
+    err = nvs_get_blob(my_handle, "notes_blob", NULL, &required_size);
+    if (err != ESP_OK || required_size == 0) {
+        nvs_close(my_handle);
+        return;
+    }
+
+    uint8_t * blob = heap_caps_malloc(required_size, MALLOC_CAP_SPIRAM);
+    if (!blob) {
+        nvs_close(my_handle);
+        return;
+    }
+
+    err = nvs_get_blob(my_handle, "notes_blob", blob, &required_size);
+    if (err != ESP_OK) {
+        heap_caps_free(blob);
+        nvs_close(my_handle);
+        return;
+    }
+
+    uint8_t * ptr = blob;
+    uint32_t version = 0;
+    memcpy(&version, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+
+    if (version == 1 || version == 2) {
+        for (int i = 0; i < MAX_NOTES; i++) {
+            bool in_use = false;
+            memcpy(&in_use, ptr, sizeof(bool)); ptr += sizeof(bool);
+            notes_db[i].in_use = in_use;
+
+            if (in_use) {
+                uint32_t sc = 0;
+                memcpy(&sc, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                notes_db[i].stroke_cnt = sc;
+
+                for (uint32_t s = 0; s < sc; s++) {
+                    uint32_t pc = 0;
+                    memcpy(&pc, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                    notes_db[i].strokes[s].point_cnt = pc;
+                    notes_db[i].strokes[s].point_cap = pc;
+
+                    uint16_t w = 0;
+                    memcpy(&w, ptr, sizeof(uint16_t)); ptr += sizeof(uint16_t);
+                    notes_db[i].strokes[s].width = w;
+                    
+                    if (version == 2) {
+                        uint8_t cr = *ptr++;
+                        uint8_t cg = *ptr++;
+                        uint8_t cb = *ptr++;
+                        notes_db[i].strokes[s].color = lv_color_make(cr, cg, cb);
+                    } else {
+                        notes_db[i].strokes[s].color = lv_color_black();
+                    }
+                    
+                    notes_db[i].strokes[s].edit_line_obj = NULL;
+
+                    size_t points_size = pc * sizeof(lv_point_precise_t);
+                    notes_db[i].strokes[s].points = heap_caps_malloc(points_size, MALLOC_CAP_SPIRAM);
+                    memcpy(notes_db[i].strokes[s].points, ptr, points_size); ptr += points_size;
+                }
+            } else {
+                notes_db[i].stroke_cnt = 0;
+            }
+        }
+    }
+
+    heap_caps_free(blob);
+    nvs_close(my_handle);
+}
 
 static void btn_go_notes_cb_internal(lv_event_t * e) {
     if (notes_menu_scr) {
@@ -58,6 +202,9 @@ static void btn_save_note_cb(lv_event_t * e) {
             notes_db[target_note_idx].strokes[i].edit_line_obj = NULL;
         }
     }
+
+    save_notes_to_nvs();
+
     lv_obj_clean(draw_canvas_area);
     render_thumbnails();
     lv_scr_load(notes_menu_scr);
@@ -79,6 +226,9 @@ static void btn_delete_yes_cb(lv_event_t * e) {
         }
         note->stroke_cnt = 0;
         note->in_use = false;
+
+        save_notes_to_nvs();
+
         render_thumbnails();
     }
     if (note_delete_mbox) {
@@ -175,7 +325,7 @@ static void render_thumbnails(void) {
 
                 lv_obj_t * l = lv_line_create(btn);
                 lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, 0);
-                lv_obj_set_style_line_color(l, lv_color_hex(0x000000), 0);
+                lv_obj_set_style_line_color(l, st->color, 0);
                 // thumbnail scale width
                 int scaled_w = st->width / 3;
                 if (scaled_w < 1) scaled_w = 1;
@@ -186,7 +336,7 @@ static void render_thumbnails(void) {
                 if (scaled_pts) {
                     for(uint32_t p = 0; p < st->point_cnt; p++) {
                         scaled_pts[p].x = (st->points[p].x * 200) / (LCD_H_RES - 20);
-                        scaled_pts[p].y = (st->points[p].y * 200) / (LCD_V_RES - 80);
+                        scaled_pts[p].y = (st->points[p].y * 200) / (LCD_V_RES - 140);
                     }
                     lv_line_set_points(l, scaled_pts, st->point_cnt);
                     lv_obj_add_event_cb(l, free_points_cb, LV_EVENT_DELETE, scaled_pts);
@@ -233,8 +383,8 @@ static void draw_area_event_cb(lv_event_t * e) {
         current_stroke->point_cnt = 0;
         current_stroke->point_cap = 128;
         current_stroke->points = heap_caps_malloc(128 * sizeof(lv_point_precise_t), MALLOC_CAP_SPIRAM);
-        current_stroke->color = lv_color_black();
-        current_stroke->width = 5;
+        current_stroke->color = is_eraser ? lv_color_white() : active_color;
+        current_stroke->width = active_width;
 
         current_stroke->edit_line_obj = lv_line_create(draw_canvas_area);
         lv_obj_align(current_stroke->edit_line_obj, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -274,11 +424,29 @@ static void draw_area_event_cb(lv_event_t * e) {
     }
 }
 
+static void color_btn_cb(lv_event_t * e) {
+    lv_obj_t * btn = lv_event_get_target(e);
+    active_color = lv_obj_get_style_bg_color(btn, 0);
+    is_eraser = false;
+}
+
+static void eraser_btn_cb(lv_event_t * e) {
+    is_eraser = true;
+}
+
+static void slider_width_cb(lv_event_t * e) {
+    lv_obj_t * slider = lv_event_get_target(e);
+    active_width = lv_slider_get_value(slider);
+}
+
 void create_notes_screens(lv_obj_t * main_menu_scr, lv_event_cb_t go_menu_cb) {
     main_menu_scr_ptr = main_menu_scr;
     main_menu_cb_ptr = go_menu_cb;
 
     memset(notes_db, 0, sizeof(notes_db));
+
+    // Load notes from NVS
+    load_notes_from_nvs();
 
     notes_menu_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(notes_menu_scr, lv_color_hex(0x222222), 0);
@@ -337,11 +505,52 @@ void create_notes_screens(lv_obj_t * main_menu_scr, lv_event_cb_t go_menu_cb) {
     lv_obj_center(lbl_done);
     lv_obj_add_event_cb(btn_done, btn_save_note_cb, LV_EVENT_CLICKED, NULL);
 
+    active_color = lv_color_black();
+    active_width = 5;
+    is_eraser = false;
+
+    lv_obj_t * tools_cont = lv_obj_create(notes_edit_scr);
+    lv_obj_set_size(tools_cont, LCD_H_RES, 70);
+    lv_obj_align(tools_cont, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tools_cont, lv_color_hex(0x222222), 0);
+    lv_obj_set_style_border_width(tools_cont, 0, 0);
+    lv_obj_set_style_radius(tools_cont, 0, 0);
+    lv_obj_set_flex_flow(tools_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(tools_cont, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tools_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_color_t colors[] = { lv_color_black(), lv_color_make(255, 0, 0), lv_color_make(0, 255, 0), lv_color_make(0, 0, 255) };
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t * c_btn = lv_btn_create(tools_cont);
+        lv_obj_set_size(c_btn, 40, 40);
+        lv_obj_set_style_bg_color(c_btn, colors[i], 0);
+        lv_obj_set_style_radius(c_btn, 20, 0);
+        lv_obj_add_event_cb(c_btn, color_btn_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    lv_obj_t * btn_eraser = lv_btn_create(tools_cont);
+    lv_obj_set_size(btn_eraser, 100, 40);
+    lv_obj_add_event_cb(btn_eraser, eraser_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * lbl_eraser = lv_label_create(btn_eraser);
+    lv_label_set_text(lbl_eraser, "Eraser");
+    lv_obj_center(lbl_eraser);
+
+    lv_obj_t * width_cont = lv_obj_create(tools_cont);
+    lv_obj_set_size(width_cont, 200, 50);
+    lv_obj_set_style_bg_opa(width_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(width_cont, 0, 0);
+    lv_obj_clear_flag(width_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * w_slider = lv_slider_create(width_cont);
+    lv_slider_set_range(w_slider, 2, 20);
+    lv_slider_set_value(w_slider, active_width, LV_ANIM_OFF);
+    lv_obj_set_size(w_slider, 160, 10);
+    lv_obj_align(w_slider, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_add_event_cb(w_slider, slider_width_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
     draw_canvas_area = lv_obj_create(notes_edit_scr);
-    lv_obj_set_size(draw_canvas_area, LCD_H_RES - 20, LCD_V_RES - 80);
-    lv_obj_align(draw_canvas_area, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(draw_canvas_area, lv_color_white(), 0);
-    lv_obj_add_flag(draw_canvas_area, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(draw_canvas_area, LCD_H_RES - 20, LCD_V_RES - 140);
+    lv_obj_align(draw_canvas_area, LV_ALIGN_TOP_MID, 0, 65);
     lv_obj_clear_flag(draw_canvas_area, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(draw_canvas_area, draw_area_event_cb, LV_EVENT_ALL, NULL);
 }
