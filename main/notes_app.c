@@ -98,7 +98,7 @@ static void thumb_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     intptr_t idx = (intptr_t)lv_event_get_user_data(e);
 
-    if (code == LV_EVENT_CLICKED) {
+    if (code == LV_EVENT_SHORT_CLICKED) {
         open_note_edit((int)idx);
     } else if (code == LV_EVENT_LONG_PRESSED) {
         delete_note_idx = (int)idx;
